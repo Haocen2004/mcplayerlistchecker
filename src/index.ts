@@ -51,7 +51,6 @@ async function bootstrap() {
             const session = (mcClient as any).client?.session;
             if (session && session.selectedProfile) {
                 console.log(`[Auth] Logged in as: ${session.selectedProfile.name}`);
-                console.log(session)
             }
         });
     }
