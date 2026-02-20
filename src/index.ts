@@ -80,8 +80,8 @@ async function bootstrap() {
         console.warn('[DB] Continuing without MongoDB...');
     }
 
-    let encryptionKey = '';
-    if (authType === 'microsoft') {
+    let encryptionKey = process.env.CRYPTO_KEY || '';
+    if (authType === 'microsoft' && !encryptionKey) {
         encryptionKey = await askSecret('Enter Passphrase for Credential Encryption: ');
     }
     rl.close();

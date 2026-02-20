@@ -23,7 +23,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --only=production
 
 # Copy built artifacts from builder
-COPY --from=builder /app/build ./build
+COPY --from=builder /app/dist ./dist
 # Copy default config (optional, can be overridden by volume)
 COPY config.json ./config.json
 
@@ -34,4 +34,4 @@ EXPOSE 3000
 ENV NODE_ENV=production
 
 # Start command
-CMD ["node", "build/index.js"]
+CMD ["node", "dist/index.js"]
