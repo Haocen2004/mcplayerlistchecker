@@ -246,6 +246,7 @@ export class MCClient extends EventEmitter {
             version: status.version || '1.20.1',
             serverHost: this.host, // Use clean host initially
             auth: this.authType,
+            profilesFolder: './.minecraft_auth', // Enable built-in auth caching
             ...this.clientOptions
         };
 

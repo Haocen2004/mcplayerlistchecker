@@ -14,6 +14,7 @@ build/
 # Configuration and secrets
 config.json
 auth_cache.enc
+.minecraft_auth/
 .env
 
 # Logs

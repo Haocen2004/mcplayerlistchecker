@@ -1,8 +1,6 @@
-import * as readline from 'readline';
 import * as fs from 'fs';
 import * as path from 'path';
 import { initDb } from './db';
-import { saveEncrypted, loadEncrypted } from './crypto';
 import { MCClient, LogLevel } from './mcClient';
 import { startApiServer } from './api';
 
@@ -37,40 +35,6 @@ async function bootstrap() {
 
     const logLevel = (LogLevel as any)[logLevelStr] ?? LogLevel.INFO;
 
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-    });
-
-    const askSecret = (query: string): Promise<string> => {
-        return new Promise((resolve) => {
-            process.stdout.write(query);
-            const stdin = process.stdin;
-            stdin.setRawMode(true);
-            stdin.resume();
-            let key = "";
-            const onData = (chunk: Buffer) => {
-                const char = chunk.toString('utf8');
-                switch (char) {
-                    case "\n": case "\r": case "\u0004":
-                        stdin.setRawMode(false);
-                        stdin.removeListener('data', onData);
-                        process.stdout.write("\n");
-                        resolve(key);
-                        break;
-                    case "\u0003": process.exit(); break;
-                    case "\u0008": case "\u007f":
-                        if (key.length > 0) key = key.substring(0, key.length - 1);
-                        break;
-                    default:
-                        if (char.length === 1 && char.charCodeAt(0) >= 32) key += char;
-                        break;
-                }
-            };
-            stdin.on('data', onData);
-        });
-    };
-
     console.log('\n--- MC Player List Checker ---');
 
     // Initialize DB
@@ -80,30 +44,14 @@ async function bootstrap() {
         console.warn('[DB] Continuing without MongoDB...');
     }
 
-    let encryptionKey = process.env.CRYPTO_KEY || '';
-    if (authType === 'microsoft' && !encryptionKey) {
-        encryptionKey = await askSecret('Enter Passphrase for Credential Encryption: ');
-    }
-    rl.close();
-
     const mcClient = new MCClient(host, port, username, logLevel, authType);
 
-    // MS Auth cache handling
-    if (authType === 'microsoft' && encryptionKey) {
-        const cached = loadEncrypted(encryptionKey);
-        if (cached) {
-            console.log('[Auth] Loading cached MS session...');
-            mcClient.clientOptions = { ...cached };
-        }
-
+    if (authType === 'microsoft') {
         mcClient.on('connected', () => {
             const session = (mcClient as any).client?.session;
-            if (session) {
-                if (session.selectedProfile) {
-                    console.log(`[Auth] Logged in as: ${session.selectedProfile.name}`);
-                }
-                saveEncrypted(session, encryptionKey);
-                console.log('[Auth] Session cached securely.');
+            if (session && session.selectedProfile) {
+                console.log(`[Auth] Logged in as: ${session.selectedProfile.name}`);
+                console.log(session)
             }
         });
     }

@@ -4,3 +4,4 @@ build
 .gitignore
 *.log
 auth_cache.enc
+.minecraft_auth
