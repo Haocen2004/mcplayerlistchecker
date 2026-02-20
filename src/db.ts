@@ -29,6 +29,8 @@ export async function initDb(uri: string = 'mongodb://localhost:27017', dbName: 
         // Ensure indexes
         await db.collection('logs').createIndex({ timestamp: -1 });
         await db.collection('history').createIndex({ timestamp: -1 });
+        // TTL index for history (TPS/MSPT): 7 days
+        await db.collection('history').createIndex({ timestamp: 1 }, { expireAfterSeconds: 604800 });
     } catch (e) {
         console.error(`[DB] Failed to connect to MongoDB: ${e}`);
         throw e;

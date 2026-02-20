@@ -9,7 +9,7 @@
 *   **实时监控**：获取在线玩家列表、延迟 (Ping)、服务器 TPS 和 MSPT（需服务器支持 PlayerList Header/Footer）。
 *   **数据持久化**：支持连接 **MongoDB**，记录玩家进服/退服日志以及服务器历史状态（TPS 波动等）。
 *   **微软正版登录**：支持通过 Microsoft 账号登录，并自动识别实际游戏用户名。
-*   **安全凭据存储**：使用 AES-256 加密在本地缓存登录凭据，并在启动时要求输入解密密码（Passphrase），避免明文存储 Token。
+*   **自动凭据缓存**：支持通过 `profilesFolder` 自动在本地 `.minecraft_auth` 目录缓存登录凭据，实现重启后自动登录。
 *   **API & WebSocket**：
     *   提供 HTTP 接口查询当前状态。
     *   提供 WebSocket 接口实时推送玩家变动和状态更新。
@@ -22,7 +22,7 @@
 *   [Node.js](https://nodejs.org/) (建议 v18+)
 *   [MongoDB](https://www.mongodb.com/) (可选，用于数据记录)
 
-## 📦 安装
+## 📦 安装/运行
 
 1.  克隆仓库：
     ```bash
@@ -33,8 +33,14 @@
 2.  安装依赖：
     ```bash
     npm install
-    # 或者
-    npm i
+    ```
+
+3.  启动运行：
+    ```bash
+    # 开发模式
+    npx ts-node src/index.ts
+    # 编译并运行
+    npm start
     ```
 
 ## ⚙️ 配置
@@ -61,26 +67,24 @@
 npx ts-node src/index.ts [host] [port] [username] [loglevel] [--microsoft] [--config <path>]
 ```
 
-例如：
+## 🚀 关于登录 (Microsoft Auth)
+
+第一次使用微软登录时，控制台会输出一个验证码及验证链接（Microsoft Device Code）。请在浏览器中打开链接完成验证。
+
+验证成功后，登录凭据会自动加密保存在 `.minecraft_auth/` 文件夹下。下次启动时，程序会自动从该文件夹读取凭据，无需再次进行人工验证。
+
+### 🐳 Docker 运行建议
+
+如果你在 Docker 中运行，请务必挂载该目录以保持登录状态，并注意 Docker 环境与宿主机 MongoDB 的连接（Linux 通常使用主机的 `host.docker.internal`）：
+
 ```bash
-npx ts-node src/index.ts play.example.com 25565 PlayerListChecker info
+docker run -d \
+  --name mc-checker \
+  -p 3000:3000 \
+  -v $(pwd)/config.json:/app/config.json \
+  -v $(pwd)/.minecraft_auth:/app/.minecraft_auth \
+  mc-checker
 ```
-
-## 🚀 运行
-
-### 开发模式运行
-```bash
-npx ts-node-dev src/index.ts
-```
-
-### 正常启动
-```bash
-npm start
-```
-
-第一次使用微软登录时，控制台会提示你会打开浏览器进行验证。验证通过后，程序会要求你一次性输入一个 **Passphrase**（密码口令）来加密保存你的 Token。
-
-下次启动时，只需输入之前的 Passphrase 即可自动登录，无需再次扫码。
 
 ## 🔌 API 接口
 
@@ -95,10 +99,10 @@ npm start
 ## ⚠️ 常见问题
 
 **Q: 控制台出现 `PartialReadError: Unexpected buffer end` 报错？**
-A: 这是由于 `minecraft-protocol` 库在解析某些新的 1.20.2+ 或特定 Forge 数据包（如已读消息确认位图）时可能出现的警告。只要程序显示 `Logged in to Forge server!` 并且能正常接收玩家信息，该错误通常**不影响**核心监控功能，可以忽略。
+A: 这是由于 `minecraft-protocol` 库在解析某些新的 1.20.2+ 或特定 Forge 数据包时出现的警告。只要显示 `Logged in to Forge server!` 并且能正常接收玩家信息，通常不影响功能，可以忽略。
 
 **Q: 无法连接 MongoDB？**
-A: 程序会提示 `Continuing without MongoDB...` 并继续运行，只是不会记录日志。请检查本地 MongoDB 服务是否启动。
+A: 程序会提示 `Continuing without MongoDB...`。由于项目目前已降级 MongoDB 驱动以兼容旧版本（3.6+），请检查连接地址和数据库状态。
 
 ## ℹ️ 说明
 
