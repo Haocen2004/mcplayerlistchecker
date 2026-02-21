@@ -41,6 +41,7 @@ export class MCClient extends EventEmitter {
     private logLevel: LogLevel = LogLevel.INFO;
     private uuidToName: Map<string, string> = new Map();
     private authType: 'microsoft' | 'mojang' = 'mojang';
+    private botUuid: string | null = null;
     public clientOptions: any = {};
 
     constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang') {
@@ -397,8 +398,8 @@ export class MCClient extends EventEmitter {
                 this.players.delete(targetUuid);
                 this.emit('playerLeave', player);
                 this.log(LogLevel.INFO, `Player Left: ${player.username} (${targetUuid}) [via ${source}]`);
-                // Import locally to avoid top-level issues if index.ts hasn't initialized DB
-                if (player.username !== this.username) {
+                // Use botUuid for filtering
+                if (targetUuid !== this.botUuid) {
                     import('./db').then(db => db.saveLog({ type: 'leave', uuid: targetUuid, username: player!.username, server: this.host }));
                 }
             } else {
@@ -408,12 +409,10 @@ export class MCClient extends EventEmitter {
 
         const handlePlayerInfo = (packet: any, meta: any) => {
             const { action, data } = packet;
-            // console.log("handlePlayerInfo:", meta.name);
-            // const isModern = meta.name === 'player_info_update';
 
             for (const item of data) {
                 const uuid = item.uuid || item.UUID;
-                if (!uuid) continue;
+                if (!uuid || uuid === this.botUuid) continue;
 
                 let actionVal: number;
                 if (typeof action === 'number') {
@@ -421,11 +420,10 @@ export class MCClient extends EventEmitter {
                 } else if (typeof action === 'object' && action._value !== undefined) {
                     actionVal = action._value;
                 } else {
-                    // Fallback or legacy handling
+                    // Fallback for older versions if action is not a number or object with _value
                     actionVal = action.add_player ? 0 : -1;
                 }
 
-                // if (isModern) {
                 // 0x44 player_info_update bitmask handling
                 const bits = actionVal;
 
@@ -457,34 +455,6 @@ export class MCClient extends EventEmitter {
                     }
                 }
 
-                // Note: 0x40 is Priority, NOT Remove. Removal is handled by player_info_remove.
-                // } else {
-                //     // Legacy player_info (pre-1.19.3)
-                //     if (actionVal === 0) { // Add Player
-                //         const username = item.player?.name || item.name;
-                //         const latency = item.latency ?? item.ping;
-                //         if (username) {
-                //             const player: Player = { uuid, username, latency: latency || 0 };
-                //             if (!this.players.has(uuid)) {
-                //                 this.players.set(uuid, player);
-                //                 this.uuidToName.set(uuid, username);
-                //                 this.emit('playerJoin', player);
-                //                 this.log(LogLevel.INFO, `Player Joined: ${username} (${uuid})`);
-                //                 if (username !== this.username) {
-                //                     import('./db').then(db => db.saveLog({ type: 'join', uuid, username, server: this.host }));
-                //                 }
-                //             }
-                //         }
-                //     } else if (actionVal === 2) { // Update Latency
-                //         const latency = item.latency ?? item.ping;
-                //         const player = this.players.get(uuid);
-                //         if (player) {
-                //             player.latency = latency || 0;
-                //         }
-                //     } else if (actionVal === 4) { // Remove Player
-                //         removePlayerByUuid(uuid, 'Action');
-                //     }
-                // }
             }
         };
 
@@ -584,11 +554,12 @@ export class MCClient extends EventEmitter {
             this.reconnectTimeout = setTimeout(() => this.connect(), 5000);
         });
 
-        this.client.on('success', () => {
+        this.client.on('success', (packet) => {
             this.log(LogLevel.INFO, 'Logged in to Forge server!');
             if (this.client) {
                 this.username = this.client.username;
-                this.log(LogLevel.INFO, `Username updated to: ${this.username}`);
+                this.botUuid = packet.uuid || this.client.uuid; // Capture bot's own UUID
+                this.log(LogLevel.INFO, `BOT Username: ${this.username}, UUID: ${this.botUuid}`);
             }
             this.emit('connected');
         });
@@ -607,6 +578,9 @@ export class MCClient extends EventEmitter {
     }
 
     public getStatus(): ServerStatus {
-        return this.status;
+        return {
+            ...this.status,
+            playersOnline: this.players.size // Real-time count from active list
+        };
     }
 }
