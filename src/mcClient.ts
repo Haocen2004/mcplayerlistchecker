@@ -408,7 +408,8 @@ export class MCClient extends EventEmitter {
 
         const handlePlayerInfo = (packet: any, meta: any) => {
             const { action, data } = packet;
-            const isModern = meta.name === 'player_info_update';
+            // console.log("handlePlayerInfo:", meta.name);
+            // const isModern = meta.name === 'player_info_update';
 
             for (const item of data) {
                 const uuid = item.uuid || item.UUID;
@@ -424,66 +425,66 @@ export class MCClient extends EventEmitter {
                     actionVal = action.add_player ? 0 : -1;
                 }
 
-                if (isModern) {
-                    // 0x44 player_info_update bitmask handling
-                    const bits = actionVal;
+                // if (isModern) {
+                // 0x44 player_info_update bitmask handling
+                const bits = actionVal;
 
-                    // 0x01: Add Player
-                    if (bits & 0x01) {
-                        const username = item.player?.name || item.name;
-                        const latency = item.latency ?? item.ping;
-                        if (username) {
-                            const player: Player = { uuid, username, latency: latency || 0 };
-                            if (!this.players.has(uuid)) {
-                                this.players.set(uuid, player);
-                                this.uuidToName.set(uuid, username);
-                                this.emit('playerJoin', player);
-                                this.log(LogLevel.INFO, `Player Joined: ${username} (${uuid})`);
-                                if (username !== this.username) {
-                                    import('./db').then(db => db.saveLog({ type: 'join', uuid, username, server: this.host }));
-                                }
+                // 0x01: Add Player
+                if (bits & 0x01) {
+                    const username = item.player?.name || item.name;
+                    const latency = item.latency ?? item.ping;
+                    if (username) {
+                        const player: Player = { uuid, username, latency: latency || 0 };
+                        if (!this.players.has(uuid)) {
+                            this.players.set(uuid, player);
+                            this.uuidToName.set(uuid, username);
+                            this.emit('playerJoin', player);
+                            this.log(LogLevel.INFO, `Player Joined: ${username} (${uuid})`);
+                            if (username !== this.username) {
+                                import('./db').then(db => db.saveLog({ type: 'join', uuid, username, server: this.host }));
                             }
                         }
-                    }
-
-                    // 0x10: Update Latency
-                    if (bits & 0x10) {
-                        const latency = item.latency ?? item.ping;
-                        const player = this.players.get(uuid);
-                        if (player) {
-                            player.latency = latency || 0;
-                            this.log(LogLevel.DEBUG, `Player Latency Updated: ${player.username} (${latency}ms)`);
-                        }
-                    }
-
-                    // Note: 0x40 is Priority, NOT Remove. Removal is handled by player_info_remove.
-                } else {
-                    // Legacy player_info (pre-1.19.3)
-                    if (actionVal === 0) { // Add Player
-                        const username = item.player?.name || item.name;
-                        const latency = item.latency ?? item.ping;
-                        if (username) {
-                            const player: Player = { uuid, username, latency: latency || 0 };
-                            if (!this.players.has(uuid)) {
-                                this.players.set(uuid, player);
-                                this.uuidToName.set(uuid, username);
-                                this.emit('playerJoin', player);
-                                this.log(LogLevel.INFO, `Player Joined: ${username} (${uuid})`);
-                                if (username !== this.username) {
-                                    import('./db').then(db => db.saveLog({ type: 'join', uuid, username, server: this.host }));
-                                }
-                            }
-                        }
-                    } else if (actionVal === 2) { // Update Latency
-                        const latency = item.latency ?? item.ping;
-                        const player = this.players.get(uuid);
-                        if (player) {
-                            player.latency = latency || 0;
-                        }
-                    } else if (actionVal === 4) { // Remove Player
-                        removePlayerByUuid(uuid, 'Action');
                     }
                 }
+
+                // 0x10: Update Latency
+                if (bits & 0x10) {
+                    const latency = item.latency ?? item.ping;
+                    const player = this.players.get(uuid);
+                    if (player) {
+                        player.latency = latency || 0;
+                        this.log(LogLevel.DEBUG, `Player Latency Updated: ${player.username} (${latency}ms)`);
+                    }
+                }
+
+                // Note: 0x40 is Priority, NOT Remove. Removal is handled by player_info_remove.
+                // } else {
+                //     // Legacy player_info (pre-1.19.3)
+                //     if (actionVal === 0) { // Add Player
+                //         const username = item.player?.name || item.name;
+                //         const latency = item.latency ?? item.ping;
+                //         if (username) {
+                //             const player: Player = { uuid, username, latency: latency || 0 };
+                //             if (!this.players.has(uuid)) {
+                //                 this.players.set(uuid, player);
+                //                 this.uuidToName.set(uuid, username);
+                //                 this.emit('playerJoin', player);
+                //                 this.log(LogLevel.INFO, `Player Joined: ${username} (${uuid})`);
+                //                 if (username !== this.username) {
+                //                     import('./db').then(db => db.saveLog({ type: 'join', uuid, username, server: this.host }));
+                //                 }
+                //             }
+                //         }
+                //     } else if (actionVal === 2) { // Update Latency
+                //         const latency = item.latency ?? item.ping;
+                //         const player = this.players.get(uuid);
+                //         if (player) {
+                //             player.latency = latency || 0;
+                //         }
+                //     } else if (actionVal === 4) { // Remove Player
+                //         removePlayerByUuid(uuid, 'Action');
+                //     }
+                // }
             }
         };
 
