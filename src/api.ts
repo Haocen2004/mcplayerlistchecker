@@ -69,6 +69,10 @@ export function startApiServer(mcClient: MCClient, port: number = 3000) {
         broadcast({ type: 'status', data: status });
     });
 
+    mcClient.on('chat', (chatData) => {
+        broadcast({ type: 'chat', data: chatData });
+    });
+
     function broadcast(msgObj: any) {
         const msg = JSON.stringify(msgObj);
         wss.clients.forEach(client => {

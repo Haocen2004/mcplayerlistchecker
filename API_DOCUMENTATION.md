@@ -28,7 +28,7 @@ Returns the current server status and the list of online players.
     "fmlVersion": "FML3",
     "tps": "20.0",
     "mspt": "15.5"
-    // Note: 'mods' list is excluded from this response
+    // Note: 'mods' list is excluded from this response for short response
   },
   "players": [
     {
@@ -123,5 +123,17 @@ Sent when server status (e.g., TPS/MSPT) changes.
 {
   "type": "status",
   "data": { ... }
+}
+```
+
+**6. Chat Message Event**
+Sent when a chat or system message is received.
+```json
+{
+  "type": "chat",
+  "data": {
+    "sender": "PlayerName", // 或 "System"
+    "message": "Hello world!"
+  }
 }
 ```
