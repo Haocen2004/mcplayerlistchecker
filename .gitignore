@@ -16,6 +16,7 @@ config.json
 auth_cache.enc
 .minecraft_auth/
 .env
+docker.sh
 
 # Logs
 npm-debug.log*
