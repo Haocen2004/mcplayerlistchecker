@@ -455,6 +455,12 @@ export class MCClient extends EventEmitter {
                     }
                 }
 
+                if (typeof action === 'string') {
+                    if (action === "remove_player") {
+                        removePlayerByUuid(uuid, 'PlayerInfo Action: Remove Player');
+                    }
+                }
+
             }
         };
 
