@@ -252,9 +252,29 @@ export class MCClient extends EventEmitter {
             serverHost: this.host, // Use clean host initially
             auth: this.authType,
             profilesFolder: './.minecraft_auth', // Enable built-in auth caching
-            hideErrors: this.compressionType === 'zstd',
+            hideErrors: true, // Suppress packet parsing errors (e.g. declare_commands on modded servers)
             ...this.clientOptions
         };
+
+        // Patch protodef FullPacketParser to skip ALL parse errors (not just PartialReadError).
+        // Without this, non-PartialReadError exceptions (e.g. TypeError from tryCatch returning
+        // undefined) destroy the stream pipeline and kill the socket connection.
+        const { FullPacketParser } = require('protodef');
+        if (!FullPacketParser.prototype.__patchedTransform) {
+            const origTransform = FullPacketParser.prototype._transform;
+            FullPacketParser.prototype._transform = function (chunk: Buffer, enc: string, cb: Function) {
+                origTransform.call(this, chunk, enc, (err?: Error) => {
+                    if (err) {
+                        if (!this.noErrorLogging) {
+                            console.warn('[Packet] Parse error (skipped):', (err as any).message || err);
+                        }
+                        return cb();
+                    }
+                    cb();
+                });
+            };
+            FullPacketParser.prototype.__patchedTransform = true;
+        }
 
         this.client = mc.createClient(options);
 
@@ -272,11 +292,11 @@ export class MCClient extends EventEmitter {
             // These cause "unexpected index 0" errors because FML3 expects wrapped packets.
             if (packetName === 'login_plugin_response') {
                 if (!params.data || params.data.length === 0) {
-                    console.log(`[Plugin] Blocking auto-response for ID ${params.messageId}`);
+                    // console.log(`[Plugin] Blocking auto-response for ID ${params.messageId}`);
                     return; // DO NOT SEND
                 }
                 const dataHex = params.data.toString('hex').slice(0, 32);
-                console.log(`[Plugin] Sending wrapped response ID ${params.messageId}, length: ${params.data.length}, data: ${dataHex}...`);
+                // console.log(`[Plugin] Sending wrapped response ID ${params.messageId}, length: ${params.data.length}, data: ${dataHex}...`);
             }
 
             return oldWrite.call(this.client, packetName, params);
@@ -311,7 +331,7 @@ export class MCClient extends EventEmitter {
                 const innerLen = this.readVarInt(buf, offset); // Inner packet length
                 const packetID = this.readVarInt(buf, offset);
 
-                console.log(`[Plugin] FML Channel: ${fmlChannel}, PacketID: ${packetID}`);
+                // console.log(`[Plugin] FML Channel: ${fmlChannel}, PacketID: ${packetID}`);
 
                 if (fmlChannel === 'fml:handshake') {
                     let wrappedPayload: Buffer | null = null;
@@ -560,7 +580,14 @@ export class MCClient extends EventEmitter {
             this.reconnectTimeout = setTimeout(() => this.connect(), 5000);
         });
 
-        this.client.on('error', (err) => {
+        this.client.on('error', (err: any) => {
+            // Non-fatal: packet deserialization errors should not trigger reconnect.
+            // These include PartialReadError and "Deserialization error for play.toClient".
+            if (err.partialReadError || (err.field && typeof err.field === 'string' && err.field.includes('toClient'))) {
+                this.log(LogLevel.WARN, `Packet parse error (non-fatal): ${err.message}`);
+                return;
+            }
+            console.error('Client Error:', err);
             this.log(LogLevel.ERR, `Client Error: ${err.message}`);
             this.reconnectTimeout = setTimeout(() => this.connect(), 5000);
         });
