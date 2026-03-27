@@ -31,7 +31,7 @@ COPY --from=builder /app/node_modules ./node_modules
 # 拷贝编译后的 js 代码
 COPY --from=builder /app/dist ./dist
 # 拷贝配置文件
-COPY package.json config.json ./
+# COPY package.json config.json ./
 
 # 设置环境变量
 ENV NODE_ENV=production
