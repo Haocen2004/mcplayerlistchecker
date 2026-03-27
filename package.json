@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "dev": "ts-node-dev src/index.ts",
     "start": "tsc && node dist/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -17,7 +18,8 @@
     "minecraft-protocol": "^1.1.1",
     "minecraft-protocol-forge": "^1.0.0",
     "mongodb": "^4.17.2",
-    "ws": "^8.19.0"
+    "ws": "^8.19.0",
+    "zstd-napi": "^0.0.12"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

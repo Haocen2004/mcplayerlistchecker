@@ -1,5 +1,6 @@
 import * as mc from 'minecraft-protocol';
 import { EventEmitter } from 'events';
+import { applyCompression, CompressionType } from './compression';
 
 export enum LogLevel {
     SILENT = 0,
@@ -42,15 +43,18 @@ export class MCClient extends EventEmitter {
     private uuidToName: Map<string, string> = new Map();
     private authType: 'microsoft' | 'mojang' = 'mojang';
     private botUuid: string | null = null;
+    private compressionType: CompressionType = 'zlib';
     public clientOptions: any = {};
 
-    constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang') {
+    constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang', compressionType: CompressionType = 'zlib') {
         super();
         this.host = host;
         this.port = port;
         this.username = username;
         this.logLevel = logLevel;
         this.authType = authType;
+        this.compressionType = compressionType;
+        applyCompression(this.compressionType);
     }
 
     private log(level: LogLevel, message: string) {
@@ -248,6 +252,7 @@ export class MCClient extends EventEmitter {
             serverHost: this.host, // Use clean host initially
             auth: this.authType,
             profilesFolder: './.minecraft_auth', // Enable built-in auth caching
+            hideErrors: this.compressionType === 'zstd',
             ...this.clientOptions
         };
 

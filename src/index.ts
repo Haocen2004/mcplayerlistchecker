@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { initDb } from './db';
 import { MCClient, LogLevel } from './mcClient';
+import { CompressionType } from './compression';
 import { startApiServer } from './api';
 
 async function bootstrap() {
@@ -32,6 +33,7 @@ async function bootstrap() {
     const apiPort = config.apiPort || 3000;
     const mongoUri = config.mongoUri || 'mongodb://localhost:27017';
     const mongoDb = config.mongoDb || 'mc_checker';
+    const compressionType: CompressionType = (config.compression === 'zstd') ? 'zstd' : 'zlib';
 
     const logLevel = (LogLevel as any)[logLevelStr] ?? LogLevel.INFO;
 
@@ -44,7 +46,7 @@ async function bootstrap() {
         console.warn('[DB] Continuing without MongoDB...');
     }
 
-    const mcClient = new MCClient(host, port, username, logLevel, authType);
+    const mcClient = new MCClient(host, port, username, logLevel, authType, compressionType);
 
     if (authType === 'microsoft') {
         mcClient.on('connected', () => {
@@ -61,6 +63,7 @@ async function bootstrap() {
     console.log(`\nMC Player List Checker started.`);
     console.log(`Target Server: ${host}:${port}`);
     console.log(`Auth Type: ${authType}`);
+    console.log(`Compression: ${compressionType}`);
     console.log(`Log Level: ${LogLevel[logLevel]}`);
     console.log(`API: http://localhost:${apiPort}/players\n`);
     console.log(`Usage: npx ts-node src/index.ts [host] [port] [username] [loglevel] [--microsoft] [--config path/to/config.json]\n`);
