@@ -1,0 +1,36 @@
+name: Build and Push Docker Image
+
+on:
+    push:
+        branches: ["main"] # 仅在推送到 main 分支时触发
+    pull_request:
+        branches: ["main"]
+
+jobs:
+    build-and-push:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+              # Buildx 支持更高级的缓存功能
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - name: Build and push
+              uses: docker/build-push-action@v5
+              with:
+                  context: .
+                  push: true
+                  # 替换为你的镜像名称
+                  tags: ${{ secrets.DOCKERHUB_USERNAME }}/mc-checker:latest
+                  # 使用 GitHub Actions 缓存来加速后续构建
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
