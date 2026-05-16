@@ -101,11 +101,13 @@ npx ts-node src/index.ts [host] [port] [username] [loglevel] [--microsoft] [--co
 如果你在 Docker 中运行，请务必挂载该目录以保持登录状态，并注意 Docker 环境与宿主机 MongoDB 的连接（Linux 通常使用主机的 `host.docker.internal`）：
 
 ```bash
+touch .neoforge_probe_cache.json
 docker run -d \
   --name mc-checker \
   -p 3000:3000 \
   -v $(pwd)/config.json:/app/config.json \
   -v $(pwd)/.minecraft_auth:/app/.minecraft_auth \
+  -v $(pwd)/.neoforge_probe_cache.json:/app/.neoforge_probe_cache.json \
   mc-checker
 ```
 
