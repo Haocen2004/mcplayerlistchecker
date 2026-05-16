@@ -4,6 +4,7 @@ import { initDb } from './db';
 import { MCClient, LogLevel } from './mcClient';
 import { CompressionType } from './compression';
 import { startApiServer } from './api';
+import { startNeoForgeConfigServer } from './neoforgeConfigServer';
 
 async function bootstrap() {
     // 1. Determine config path
@@ -34,8 +35,22 @@ async function bootstrap() {
     const mongoUri = config.mongoUri || 'mongodb://localhost:27017';
     const mongoDb = config.mongoDb || 'mc_checker';
     const compressionType: CompressionType = (config.compression === 'zstd') ? 'zstd' : 'zlib';
+    const serverMode = process.argv.includes('--server-mode') || config.mode === 'server' || config.serverMode === true;
 
     const logLevel = (LogLevel as any)[logLevelStr] ?? LogLevel.INFO;
+
+    if (serverMode) {
+        startNeoForgeConfigServer({
+            listenHost: config.serverModeHost || config.captureHost || '0.0.0.0',
+            listenPort: Number(config.serverModePort || config.capturePort || 25566),
+            targetHost: host,
+            targetPort: port,
+            minecraftVersion: config.minecraftVersion || '1.21.1',
+            cacheFile: config.neoforgeProbeCacheFile,
+            captureTimeoutMs: config.serverModeCaptureTimeoutMs
+        });
+        return;
+    }
 
     console.log('\n--- MC Player List Checker ---');
 
@@ -47,6 +62,17 @@ async function bootstrap() {
     }
 
     const mcClient = new MCClient(host, port, username, logLevel, authType, compressionType);
+    if (config.minecraftVersion) mcClient.clientOptions.version = config.minecraftVersion;
+    if (config.modLoader) mcClient.clientOptions.modLoader = config.modLoader;
+    if (config.neoforgeProbe !== undefined) mcClient.clientOptions.neoforgeProbe = config.neoforgeProbe;
+    if (config.neoforgeProbeMaxChannels !== undefined) mcClient.clientOptions.neoforgeProbeMaxChannels = config.neoforgeProbeMaxChannels;
+    if (config.neoforgeProbeRetryDelayMs !== undefined) mcClient.clientOptions.neoforgeProbeRetryDelayMs = config.neoforgeProbeRetryDelayMs;
+    if (config.neoforgeProbeCacheFile) mcClient.clientOptions.neoforgeProbeCacheFile = config.neoforgeProbeCacheFile;
+    if (config.minecraftSessionJoinThrottle !== undefined) mcClient.clientOptions.minecraftSessionJoinThrottle = config.minecraftSessionJoinThrottle;
+    if (config.minecraftSessionJoinMinIntervalMs !== undefined) mcClient.clientOptions.minecraftSessionJoinMinIntervalMs = config.minecraftSessionJoinMinIntervalMs;
+    if (config.minecraftSessionJoinRateLimitBackoffMs !== undefined) mcClient.clientOptions.minecraftSessionJoinRateLimitBackoffMs = config.minecraftSessionJoinRateLimitBackoffMs;
+    if (config.neoforgeChannels) mcClient.clientOptions.neoforgeChannels = config.neoforgeChannels;
+    if (config.hideErrors !== undefined) mcClient.clientOptions.hideErrors = config.hideErrors;
 
     if (authType === 'microsoft') {
         mcClient.on('connected', () => {

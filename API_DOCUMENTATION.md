@@ -19,12 +19,14 @@ Returns the current server status and the list of online players.
 {
   "status": {
     "online": true,
-    "version": "1.20.1",
-    "protocol": 763,
+    "version": "1.21.1",
+    "protocol": 767,
     "motd": "A Minecraft Server",
     "playersOnline": 5,
     "playersMax": 20,
-    "isForge": true,
+    "isForge": false,
+    "isNeoForge": true,
+    "modLoader": "neoforge",
     "fmlVersion": "FML3",
     "tps": "20.0",
     "mspt": "15.5"
@@ -50,7 +52,7 @@ Returns only the current server status information.
 ```json
 {
   "online": true,
-  "version": "1.20.1",
+  "version": "1.21.1",
   ...
   "tps": "20.0",
   "mspt": "15.5"

@@ -2,7 +2,7 @@
 
 这是一个基于 Node.js 的 Minecraft 服务器监控工具，旨在实时监测服务器在线玩家列表、TPS/MSPT 等状态信息，并通过 API 和 WebSocket 提供数据接口。
 
-特别针对 **Minecraft 1.20.1 Forge** 服务器进行了适配（支持 FML3 握手协议）。
+特别针对 **Minecraft 1.21.1 NeoForge** 服务器进行了适配，同时保留现代 Forge 的 FML3 握手处理。
 
 ## ✨ 主要功能
 
@@ -15,7 +15,7 @@
     *   提供 WebSocket 接口实时推送玩家变动和状态更新。
     *   支持 WebSocket 双向通信：发送任意消息即可触发立即刷新。
 *   **智能过滤**：自动过滤机器人自身的进退服记录，不做无效统计。
-*   **Forge 支持**：内置对 Forge 1.20.1+ 网络协议的特殊处理（Handshake Tagging）。
+*   **NeoForge/Forge 支持**：内置 NeoForge 1.21.1 配置阶段网络协商，以及 Forge FML3 握手处理。
 
 ## 🛠️ 环境要求
 
@@ -52,19 +52,42 @@
     "host": "localhost",      // 目标服务器 IP
     "port": 25565,            // 目标服务器端口
     "username": "PlayerListChecker",  // 默认用户名 (微软登录后会自动更新)
-    "logLevel": "info",       // 日志等级: silent, err, warn, info, debug, verbose
+    "logLevel": "info",       // 日志等级: silent, err, warn, info, debug, verbose, trace
     "microsoft": true,        // 是否启用微软正版验证
+    "minecraftVersion": "1.21.1", // 可选：强制指定协议版本
+    "modLoader": "neoforge",  // 可选：vanilla, forge, neoforge, modded
+    "neoforgeProbe": true,    // 可选：主动探测 NeoForge 必需 payload
+    "neoforgeProbeRetryDelayMs": 1000, // 可选：主动探测失败后的快速重试间隔
+    "minecraftSessionJoinThrottle": true, // 可选：probe 时节流正版 session join
+    "minecraftSessionJoinMinIntervalMs": 3000, // 可选：session join 最小间隔
+    "minecraftSessionJoinRateLimitBackoffMs": 15000, // 可选：session join 限流后的退避时间
+    "neoforgeProbeCacheFile": ".neoforge_probe_cache.json", // 可选：主动探测缓存路径
+    "mode": "client",        // 可选：client 或 server；server 用于真实客户端采集配置
+    "serverModeHost": "0.0.0.0", // 可选：server 模式监听地址
+    "serverModePort": 25566, // 可选：server 模式监听端口
     "apiPort": 3000,          // API 服务器端口
     "mongoUri": "mongodb://localhost:27017", // MongoDB 连接地址
     "mongoDb": "mc_checker"   // 数据库名称
 }
 ```
 
+NeoForge 1.21.1 服务器如果要求额外的 mod payload，本程序会在 `neoforgeProbe` 开启时主动探测缺失频道，并把探测进度缓存到 `.neoforge_probe_cache.json`。缓存 key 使用 `服务器地址:端口_协议版本` 的 hash，支持中途停止后继续探测，也支持多个服务器自动切换，不需要把特定服务器的频道列表硬编码进 `config.json`。关闭 `neoforgeProbe` 只会停止主动学习新频道，已有缓存仍会加载使用。probe 重连会触发正版 session join，默认会对这一步做串行节流，避免快速探测时被 Mojang session server 限流。
+
+### NeoForge Server 采集模式
+
+如果你有真实 NeoForge 客户端，可以让客户端连接到本程序一次，直接采集客户端发送的 `neoforge:register` 全量 payload 声明并写入同一个 probe 缓存：
+
+```bash
+npx ts-node src/index.ts --server-mode
+```
+
+默认监听 `0.0.0.0:25566`。客户端进入服务器列表连接 `127.0.0.1:25566`，采集完成后程序会写入 `.neoforge_probe_cache.json`，随后继续完成 configuration 流程；之后正常 client 模式会按目标服务器 `host:port_协议版本` 的 hash 读取这些声明。
+
 ### 启动参数 (CLI)
 
 命令行参数优先级高于配置文件：
 ```bash
-npx ts-node src/index.ts [host] [port] [username] [loglevel] [--microsoft] [--config <path>]
+npx ts-node src/index.ts [host] [port] [username] [loglevel] [--microsoft] [--config <path>] [--server-mode]
 ```
 
 ## 🚀 关于登录 (Microsoft Auth)
@@ -99,7 +122,7 @@ docker run -d \
 ## ⚠️ 常见问题
 
 **Q: 控制台出现 `PartialReadError: Unexpected buffer end` 报错？**
-A: 这是由于 `minecraft-protocol` 库在解析某些新的 1.20.2+ 或特定 Forge 数据包时出现的警告。只要显示 `Logged in to Forge server!` 并且能正常接收玩家信息，通常不影响功能，可以忽略。
+A: 这是由于 `minecraft-protocol` 库在解析某些新的 1.20.2+、NeoForge 或特定 Forge 数据包时出现的警告。只要显示已登录并且能正常接收玩家信息，通常不影响功能，可以忽略。
 
 **Q: 无法连接 MongoDB？**
 A: 程序会提示 `Continuing without MongoDB...`。由于项目目前已降级 MongoDB 驱动以兼容旧版本（3.6+），请检查连接地址和数据库状态。

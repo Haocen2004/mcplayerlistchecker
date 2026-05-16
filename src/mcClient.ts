@@ -1,6 +1,55 @@
 import * as mc from 'minecraft-protocol';
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
+import { createHash } from 'crypto';
 import { applyCompression, CompressionType } from './compression';
+
+const DEFAULT_MC_VERSION = '1.21.1';
+const DEFAULT_RECONNECT_DELAY_MS = 5000;
+const DEFAULT_NEOFORGE_PROBE_RETRY_DELAY_MS = 1000;
+const DEFAULT_MINECRAFT_SESSION_JOIN_MIN_INTERVAL_MS = 3000;
+const DEFAULT_MINECRAFT_SESSION_JOIN_RATE_LIMIT_BACKOFF_MS = 15000;
+const NEOFORGE_COMMON_NETWORK_VERSION = 1;
+const NEOFORGE_INITIAL_CHANNELS = [
+    'minecraft:register',
+    'minecraft:unregister',
+    'neoforge:register',
+    'neoforge:network',
+    'neoforge:modded_network_setup_failed',
+    'c:version',
+    'c:register'
+];
+const NEOFORGE_PROTOCOL_ORDINALS: Record<string, number> = {
+    play: 1,
+    configuration: 4
+};
+
+interface NeoForgeChannelDeclaration {
+    id: string;
+    version: string;
+    protocols: string[];
+    flow?: 'clientbound' | 'serverbound';
+    optional?: boolean;
+}
+
+interface NeoForgeProbeState {
+    candidates: NeoForgeChannelDeclaration[];
+    candidateIndex: number;
+}
+
+interface NeoForgeProbeCacheFile {
+    version: 1;
+    servers: Record<string, {
+        updatedAt: string;
+        address?: string;
+        protocolVersion?: string;
+        modLoader?: string;
+        declarations: NeoForgeChannelDeclaration[];
+        probeStates?: Record<string, NeoForgeProbeState>;
+        defaultsByNamespace?: Record<string, Omit<NeoForgeChannelDeclaration, 'id'>>;
+    }>;
+}
 
 export enum LogLevel {
     SILENT = 0,
@@ -8,7 +57,8 @@ export enum LogLevel {
     WARN = 2,
     INFO = 3,
     DEBUG = 4,
-    VERBOSE = 5
+    VERBOSE = 5,
+    TRACE = 6
 }
 
 export interface Player {
@@ -25,6 +75,8 @@ export interface ServerStatus {
     playersOnline: number;
     playersMax: number;
     isForge: boolean;
+    isNeoForge?: boolean;
+    modLoader?: 'vanilla' | 'forge' | 'neoforge' | 'modded';
     fmlVersion?: string;
     mods?: string[];
     tps?: string;
@@ -32,6 +84,9 @@ export interface ServerStatus {
 }
 
 export class MCClient extends EventEmitter {
+    private static yggdrasilJoinThrottlePatched = false;
+    private static yggdrasilJoinQueue: Promise<void> = Promise.resolve();
+    private static nextYggdrasilJoinAt = 0;
     private client: mc.Client | null = null;
     private players: Map<string, Player> = new Map();
     private host: string;
@@ -44,6 +99,17 @@ export class MCClient extends EventEmitter {
     private authType: 'microsoft' | 'mojang' = 'mojang';
     private botUuid: string | null = null;
     private compressionType: CompressionType = 'zlib';
+    private serverModVersions: Map<string, string> = new Map();
+    private neoForgeProbeChannels: Map<string, NeoForgeProbeState> = new Map();
+    private neoForgeAcceptedChannels: Map<string, NeoForgeChannelDeclaration> = new Map();
+    private neoForgeProbeDefaultsByNamespace: Map<string, Omit<NeoForgeChannelDeclaration, 'id'>> = new Map();
+    private lastNeoForgeFailureChannel: string | null = null;
+    private neoForgeProbeCacheKey: string | null = null;
+    private neoForgeProbeCacheAddress: string | null = null;
+    private neoForgeProbeCacheProtocolVersion: string | null = null;
+    private neoForgeProbeCacheModLoader: string | null = null;
+    private neoForgePlayCacheSaved = false;
+    private pendingNeoForgeProbeReconnect = false;
     public clientOptions: any = {};
 
     constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang', compressionType: CompressionType = 'zlib') {
@@ -69,6 +135,36 @@ export class MCClient extends EventEmitter {
                 console.log(`${prefix} ${message}`);
             }
         }
+    }
+
+    private estimatePacketSize(packetName: string, params: any): number | undefined {
+        try {
+            const serializer = (this.client as any)?.serializer;
+            if (serializer?.createPacketBuffer) {
+                return serializer.createPacketBuffer({ name: packetName, params }).length;
+            }
+        } catch {
+            // Fall back to a stable approximation below.
+        }
+
+        try {
+            if (params?.data instanceof Buffer) return params.data.length;
+            const json = JSON.stringify(params, (_key, value) => {
+                if (typeof value === 'bigint') return value.toString();
+                if (Buffer.isBuffer(value)) return `<Buffer:${value.length}>`;
+                return value;
+            });
+            return json ? Buffer.byteLength(json) : 0;
+        } catch {
+            return undefined;
+        }
+    }
+
+    private tracePacket(direction: 'C->S' | 'S->C', state: string | undefined, packetName: string, size?: number, details?: string) {
+        if (this.logLevel < LogLevel.TRACE) return;
+        const sizeText = size === undefined ? 'unknown' : `${size} bytes`;
+        const suffix = details ? ` ${details}` : '';
+        this.log(LogLevel.TRACE, `[Packet ${direction}] state=${state || 'unknown'} name=${packetName} size=${sizeText}${suffix}`);
     }
 
     private decodeFML3Data(encodedData: string): Buffer {
@@ -165,6 +261,646 @@ export class MCClient extends EventEmitter {
         return Buffer.concat([this.writeVarInt(strBuf.length), strBuf]);
     }
 
+    private writeBool(value: boolean): Buffer {
+        return Buffer.from([value ? 1 : 0]);
+    }
+
+    private writeStringSet(values: string[]): Buffer {
+        return Buffer.concat([
+            this.writeVarInt(values.length),
+            ...values.map(v => this.writeString(v))
+        ]);
+    }
+
+    private writeDinnerboneChannels(channels: string[]): Buffer {
+        return Buffer.from(channels.map(channel => `${channel}\0`).join(''), 'utf8');
+    }
+
+    private traceCustomPayload(direction: 'C->S' | 'S->C', state: string | undefined, packet: any, size?: number) {
+        const channel = String(packet?.channel ?? 'unknown');
+        const data = packet?.data;
+        const dataLength = Buffer.isBuffer(data) ? data.length : undefined;
+        const detail = dataLength === undefined
+            ? `channel=${channel}`
+            : `channel=${channel} data=${dataLength} bytes`;
+        this.tracePacket(direction, state, 'custom_payload', size, detail);
+    }
+
+    private uniqueValues(values: string[]): string[] {
+        return Array.from(new Set(values.filter(v => v.length > 0)));
+    }
+
+    private normalizeNeoForgeDeclaration(channel: NeoForgeChannelDeclaration): NeoForgeChannelDeclaration {
+        const protocols = Array.isArray(channel.protocols)
+            ? this.uniqueValues(channel.protocols.map(protocol => String(protocol).toLowerCase()))
+            : ['configuration', 'play'];
+
+        return {
+            id: channel.id,
+            version: String(channel.version ?? '1'),
+            protocols: protocols.length > 0 ? protocols : ['configuration', 'play'],
+            flow: channel.flow === 'clientbound' || channel.flow === 'serverbound' ? channel.flow : undefined,
+            optional: channel.optional === true
+        };
+    }
+
+    private getNeoForgeProbeCachePath(): string {
+        const configured = this.clientOptions.neoforgeProbeCacheFile;
+        return configured
+            ? path.resolve(String(configured))
+            : path.join(process.cwd(), '.neoforge_probe_cache.json');
+    }
+
+    private readNeoForgeProbeCache(): NeoForgeProbeCacheFile {
+        const cachePath = this.getNeoForgeProbeCachePath();
+        if (!fs.existsSync(cachePath)) return { version: 1, servers: {} };
+
+        try {
+            const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+            if (parsed?.version === 1 && parsed.servers && typeof parsed.servers === 'object') {
+                return parsed as NeoForgeProbeCacheFile;
+            }
+        } catch (e) {
+            this.log(LogLevel.WARN, `[NeoForge Probe] Failed to read probe cache: ${(e as Error).message}`);
+        }
+
+        return { version: 1, servers: {} };
+    }
+
+    private writeNeoForgeProbeCache(cache: NeoForgeProbeCacheFile) {
+        const cachePath = this.getNeoForgeProbeCachePath();
+        try {
+            fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+            fs.writeFileSync(cachePath, `${JSON.stringify(cache, null, 2)}\n`, 'utf8');
+        } catch (e) {
+            this.log(LogLevel.WARN, `[NeoForge Probe] Failed to write probe cache: ${(e as Error).message}`);
+        }
+    }
+
+    private getNeoForgeProbeAddress(): string {
+        return `${this.host.toLowerCase()}:${this.port}`;
+    }
+
+    private getNeoForgeProbeProtocolVersion(resolvedVersion: string, protocol?: number): string {
+        return protocol ? String(protocol) : resolvedVersion;
+    }
+
+    private getNeoForgeProbeCacheKey(resolvedVersion: string, protocol?: number): string {
+        const source = `${this.getNeoForgeProbeAddress()}_${this.getNeoForgeProbeProtocolVersion(resolvedVersion, protocol)}`;
+        return createHash('sha256').update(source).digest('hex').slice(0, 16);
+    }
+
+    private normalizeNeoForgeProbeState(rawState: NeoForgeProbeState | undefined, channelId: string): NeoForgeProbeState | undefined {
+        if (!rawState || !Array.isArray(rawState.candidates) || rawState.candidates.length === 0) return undefined;
+
+        const candidates = rawState.candidates
+            .filter(candidate => candidate && typeof candidate.id === 'string')
+            .map(candidate => this.normalizeNeoForgeDeclaration({
+                ...candidate,
+                id: candidate.id || channelId
+            }));
+        if (candidates.length === 0) return undefined;
+
+        const requestedIndex = Number(rawState.candidateIndex);
+        const candidateIndex = Number.isFinite(requestedIndex)
+            ? Math.max(0, Math.min(candidates.length - 1, requestedIndex))
+            : 0;
+
+        return { candidates, candidateIndex };
+    }
+
+    private loadNeoForgeProbeCache(resolvedVersion: string, modLoader: string, protocol?: number) {
+        if (modLoader !== 'neoforge') return;
+
+        const nextKey = this.getNeoForgeProbeCacheKey(resolvedVersion, protocol);
+        if (this.neoForgeProbeCacheKey && this.neoForgeProbeCacheKey !== nextKey) {
+            this.neoForgeProbeChannels.clear();
+            this.neoForgeAcceptedChannels.clear();
+            this.neoForgeProbeDefaultsByNamespace.clear();
+            this.lastNeoForgeFailureChannel = null;
+        }
+
+        this.neoForgeProbeCacheKey = nextKey;
+        this.neoForgeProbeCacheAddress = this.getNeoForgeProbeAddress();
+        this.neoForgeProbeCacheProtocolVersion = this.getNeoForgeProbeProtocolVersion(resolvedVersion, protocol);
+        this.neoForgeProbeCacheModLoader = modLoader;
+        const cache = this.readNeoForgeProbeCache();
+        const serverCache = cache.servers[this.neoForgeProbeCacheKey];
+        if (!serverCache) return;
+
+        let loaded = 0;
+        for (const [channelId, rawState] of Object.entries(serverCache.probeStates || {})) {
+            const state = this.normalizeNeoForgeProbeState(rawState, channelId);
+            if (!state) continue;
+            this.neoForgeProbeChannels.set(channelId, state);
+            loaded++;
+        }
+
+        for (const raw of serverCache.declarations || []) {
+            if (!raw || typeof raw.id !== 'string') continue;
+            const declaration = this.normalizeNeoForgeDeclaration(raw);
+            if (!this.neoForgeProbeChannels.has(declaration.id)) {
+                const candidates = this.getNeoForgeProbeCandidates(declaration.id, declaration.version);
+                const candidateIndex = Math.max(0, candidates.findIndex(candidate =>
+                    candidate.version === declaration.version &&
+                    candidate.protocols.join('+') === declaration.protocols.join('+') &&
+                    (candidate.flow || '') === (declaration.flow || '')
+                ));
+                this.neoForgeProbeChannels.set(declaration.id, {
+                    candidates: candidates.length > 0 ? candidates : [declaration],
+                    candidateIndex
+                });
+                loaded++;
+            }
+            this.neoForgeAcceptedChannels.set(declaration.id, declaration);
+        }
+
+        for (const [namespace, rawDefault] of Object.entries(serverCache.defaultsByNamespace || {})) {
+            if (!rawDefault || !Array.isArray(rawDefault.protocols)) continue;
+            this.neoForgeProbeDefaultsByNamespace.set(namespace, {
+                version: String(rawDefault.version ?? '1'),
+                protocols: this.uniqueValues(rawDefault.protocols.map(protocol => String(protocol).toLowerCase())),
+                flow: rawDefault.flow === 'clientbound' || rawDefault.flow === 'serverbound' ? rawDefault.flow : undefined,
+                optional: rawDefault.optional === true
+            });
+        }
+
+        if (loaded > 0) {
+            this.log(LogLevel.INFO, `[NeoForge Probe] Loaded ${loaded} cached channel probe states (${this.neoForgeProbeCacheKey})`);
+        }
+    }
+
+    private markNeoForgeChannelAccepted(channel: NeoForgeChannelDeclaration) {
+        const declaration = this.normalizeNeoForgeDeclaration(channel);
+        this.neoForgeAcceptedChannels.set(declaration.id, declaration);
+
+        const namespace = declaration.id.split(':', 1)[0];
+        this.neoForgeProbeDefaultsByNamespace.set(namespace, {
+            version: declaration.version,
+            protocols: declaration.protocols,
+            flow: declaration.flow,
+            optional: declaration.optional
+        });
+    }
+
+    private markAllNeoForgeProbeChannelsAccepted() {
+        for (const state of this.neoForgeProbeChannels.values()) {
+            const declaration = state.candidates[state.candidateIndex];
+            if (declaration) this.markNeoForgeChannelAccepted(declaration);
+        }
+        this.saveNeoForgeProbeCache();
+    }
+
+    private saveNeoForgeProbeCache() {
+        if (!this.neoForgeProbeCacheKey) return;
+
+        const cache = this.readNeoForgeProbeCache();
+        const existing = cache.servers[this.neoForgeProbeCacheKey];
+        const declarations = new Map<string, NeoForgeChannelDeclaration>();
+        const probeStates: Record<string, NeoForgeProbeState> = {};
+
+        for (const declaration of existing?.declarations || []) {
+            if (declaration?.id) declarations.set(declaration.id, this.normalizeNeoForgeDeclaration(declaration));
+        }
+        for (const declaration of this.neoForgeAcceptedChannels.values()) {
+            declarations.set(declaration.id, this.normalizeNeoForgeDeclaration(declaration));
+        }
+        for (const [channelId, state] of this.neoForgeProbeChannels) {
+            const normalizedState = this.normalizeNeoForgeProbeState(state, channelId);
+            if (normalizedState) probeStates[channelId] = normalizedState;
+        }
+
+        const defaultsByNamespace: Record<string, Omit<NeoForgeChannelDeclaration, 'id'>> = {};
+        for (const [namespace, value] of this.neoForgeProbeDefaultsByNamespace) {
+            defaultsByNamespace[namespace] = {
+                version: value.version,
+                protocols: value.protocols,
+                flow: value.flow,
+                optional: value.optional
+            };
+        }
+
+        cache.servers[this.neoForgeProbeCacheKey] = {
+            updatedAt: new Date().toISOString(),
+            address: this.neoForgeProbeCacheAddress ?? this.getNeoForgeProbeAddress(),
+            protocolVersion: this.neoForgeProbeCacheProtocolVersion ?? undefined,
+            modLoader: this.neoForgeProbeCacheModLoader ?? undefined,
+            declarations: Array.from(declarations.values()).sort((a, b) => a.id.localeCompare(b.id)),
+            probeStates,
+            defaultsByNamespace
+        };
+        this.writeNeoForgeProbeCache(cache);
+        this.log(LogLevel.DEBUG, `[NeoForge Probe] Saved ${declarations.size} accepted channels and ${Object.keys(probeStates).length} probe states to cache (${this.neoForgeProbeCacheKey})`);
+    }
+
+    private createNeoForgeCommonVersionPayload(): Buffer {
+        return Buffer.concat([
+            this.writeVarInt(1),
+            this.writeVarInt(NEOFORGE_COMMON_NETWORK_VERSION)
+        ]);
+    }
+
+    private createNeoForgeCommonRegisterPayload(): Buffer {
+        return Buffer.concat([
+            this.writeVarInt(NEOFORGE_COMMON_NETWORK_VERSION),
+            this.writeString('play'),
+            this.writeStringSet([])
+        ]);
+    }
+
+    private getNeoForgeChannelDeclarations(): NeoForgeChannelDeclaration[] {
+        const configured = this.clientOptions.neoforgeChannels;
+        const declarations: NeoForgeChannelDeclaration[] = [];
+
+        if (Array.isArray(configured)) {
+            declarations.push(...configured.flatMap((entry: any) => {
+                if (typeof entry === 'string') {
+                    return [{
+                        id: entry,
+                        version: '1',
+                        protocols: ['configuration', 'play']
+                    }];
+                }
+                if (!entry || typeof entry.id !== 'string') return [];
+
+                return [{
+                    id: entry.id,
+                    version: String(entry.version ?? '1'),
+                    protocols: Array.isArray(entry.protocols) ? entry.protocols.map((p: any) => String(p).toLowerCase()) : ['configuration', 'play'],
+                    flow: entry.flow === 'clientbound' || entry.flow === 'serverbound' ? entry.flow : undefined,
+                    optional: entry.optional === true
+                }];
+            }));
+        }
+
+        const configuredIds = new Set(declarations.map(declaration => declaration.id));
+        for (const state of this.neoForgeProbeChannels.values()) {
+            const declaration = state.candidates[state.candidateIndex];
+            if (declaration && !configuredIds.has(declaration.id)) {
+                declarations.push(declaration);
+            }
+        }
+
+        return declarations;
+    }
+
+    private writeNeoForgeQueryComponent(channel: NeoForgeChannelDeclaration): Buffer {
+        const flowBuffers: Buffer[] = [this.writeBool(!!channel.flow)];
+        if (channel.flow) {
+            flowBuffers.push(this.writeVarInt(channel.flow === 'serverbound' ? 0 : 1));
+        }
+
+        return Buffer.concat([
+            this.writeString(channel.id),
+            this.writeString(channel.version),
+            ...flowBuffers,
+            this.writeBool(channel.optional === true)
+        ]);
+    }
+
+    private createNeoForgeModdedNetworkQueryPayload(): Buffer {
+        const byProtocol = new Map<number, NeoForgeChannelDeclaration[]>();
+        for (const channel of this.getNeoForgeChannelDeclarations()) {
+            for (const protocol of channel.protocols) {
+                const ordinal = NEOFORGE_PROTOCOL_ORDINALS[protocol];
+                if (ordinal === undefined) continue;
+                const channels = byProtocol.get(ordinal) ?? [];
+                channels.push(channel);
+                byProtocol.set(ordinal, channels);
+            }
+        }
+
+        const parts: Buffer[] = [this.writeVarInt(byProtocol.size)];
+        for (const [protocol, channels] of byProtocol) {
+            parts.push(this.writeVarInt(protocol));
+            parts.push(this.writeVarInt(channels.length));
+            parts.push(...channels.map(channel => this.writeNeoForgeQueryComponent(channel)));
+        }
+
+        return Buffer.concat(parts);
+    }
+
+    private isNeoForgeProbeEnabled(): boolean {
+        return this.clientOptions.neoforgeProbe !== false;
+    }
+
+    private getNeoForgeProbeRetryDelayMs(): number {
+        const configured = Number(this.clientOptions.neoforgeProbeRetryDelayMs);
+        return Number.isFinite(configured) && configured >= 0
+            ? configured
+            : DEFAULT_NEOFORGE_PROBE_RETRY_DELAY_MS;
+    }
+
+    private getMinecraftSessionJoinMinIntervalMs(): number {
+        const configured = Number(this.clientOptions.minecraftSessionJoinMinIntervalMs);
+        return Number.isFinite(configured) && configured >= 0
+            ? configured
+            : DEFAULT_MINECRAFT_SESSION_JOIN_MIN_INTERVAL_MS;
+    }
+
+    private getMinecraftSessionJoinRateLimitBackoffMs(): number {
+        const configured = Number(this.clientOptions.minecraftSessionJoinRateLimitBackoffMs);
+        return Number.isFinite(configured) && configured >= 0
+            ? configured
+            : DEFAULT_MINECRAFT_SESSION_JOIN_RATE_LIMIT_BACKOFF_MS;
+    }
+
+    private configureYggdrasilJoinThrottle(modLoader: string) {
+        const enabled = this.clientOptions.minecraftSessionJoinThrottle !== false &&
+            modLoader === 'neoforge' &&
+            this.isNeoForgeProbeEnabled();
+
+        (globalThis as any).__mcplcYggdrasilJoinThrottle = {
+            enabled,
+            minIntervalMs: enabled ? this.getMinecraftSessionJoinMinIntervalMs() : 0,
+            rateLimitBackoffMs: enabled ? this.getMinecraftSessionJoinRateLimitBackoffMs() : 0,
+            log: (message: string) => this.log(LogLevel.WARN, message)
+        };
+
+        this.patchYggdrasilJoinThrottle();
+    }
+
+    private patchYggdrasilJoinThrottle() {
+        if (MCClient.yggdrasilJoinThrottlePatched) return;
+
+        const yggdrasil = require('yggdrasil');
+        const originalServer = yggdrasil.server;
+        yggdrasil.server = function patchedServer(...serverArgs: any[]) {
+            const server = originalServer.apply(this, serverArgs);
+            const originalJoin = server.join.bind(server);
+
+            server.join = function throttledJoin(...joinArgs: any[]) {
+                const cb = typeof joinArgs[5] === 'function' ? joinArgs[5] : undefined;
+                const callArgs = joinArgs.slice(0, 5);
+
+                const run = async () => {
+                    const throttle = (globalThis as any).__mcplcYggdrasilJoinThrottle || {};
+                    const minIntervalMs = throttle.enabled ? Number(throttle.minIntervalMs || 0) : 0;
+                    if (minIntervalMs > 0) {
+                        const waitMs = Math.max(0, MCClient.nextYggdrasilJoinAt - Date.now());
+                        if (waitMs > 0) {
+                            throttle.log?.(`[Auth] Waiting ${waitMs}ms before session join to avoid rate limits`);
+                            await new Promise(resolve => setTimeout(resolve, waitMs));
+                        }
+                        MCClient.nextYggdrasilJoinAt = Date.now() + minIntervalMs;
+                    }
+
+                    try {
+                        return await new Promise((resolve, reject) => {
+                            originalJoin(...callArgs, (err: Error | undefined, data: any) => {
+                                if (err) reject(err);
+                                else resolve(data);
+                            });
+                        });
+                    } catch (e) {
+                        const err = e as Error;
+                        const throttle = (globalThis as any).__mcplcYggdrasilJoinThrottle || {};
+                        const backoffMs = throttle.enabled ? Number(throttle.rateLimitBackoffMs || 0) : 0;
+                        if (backoffMs > 0 && /ratelimiter|rate limit/i.test(err.message || '')) {
+                            MCClient.nextYggdrasilJoinAt = Math.max(MCClient.nextYggdrasilJoinAt, Date.now() + backoffMs);
+                            throttle.log?.(`[Auth] Session join was rate-limited; backing off ${backoffMs}ms`);
+                        }
+                        throw err;
+                    }
+                };
+
+                const job = MCClient.yggdrasilJoinQueue.then(run, run);
+                MCClient.yggdrasilJoinQueue = job.then(() => undefined, () => undefined);
+
+                if (cb) {
+                    job.then(data => cb(undefined, data), err => cb(err));
+                }
+                return job;
+            };
+
+            return server;
+        };
+
+        MCClient.yggdrasilJoinThrottlePatched = true;
+    }
+
+    private scheduleReconnect(defaultDelayMs: number) {
+        if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+
+        let delayMs = this.pendingNeoForgeProbeReconnect
+            ? this.getNeoForgeProbeRetryDelayMs()
+            : defaultDelayMs;
+        this.pendingNeoForgeProbeReconnect = false;
+
+        const authWaitMs = this.getPendingYggdrasilJoinWaitMs();
+        if (authWaitMs > delayMs) {
+            this.log(LogLevel.WARN, `[Auth] Delaying reconnect ${authWaitMs}ms until session join throttle clears`);
+            delayMs = authWaitMs;
+        }
+
+        this.reconnectTimeout = setTimeout(() => this.connect(), delayMs);
+    }
+
+    private getPendingYggdrasilJoinWaitMs(): number {
+        const throttle = (globalThis as any).__mcplcYggdrasilJoinThrottle || {};
+        if (!throttle.enabled) return 0;
+        return Math.max(0, MCClient.nextYggdrasilJoinAt - Date.now());
+    }
+
+    private getNeoForgeProbeVersionCandidates(channelId: string, hintedVersion?: string): string[] {
+        const namespace = channelId.split(':', 1)[0];
+        const modVersion = this.serverModVersions.get(namespace);
+        const versions: string[] = [];
+
+        if (hintedVersion) versions.push(hintedVersion);
+        if (modVersion) {
+            versions.push(modVersion);
+            const semver = modVersion.match(/\d+(?:\.\d+){1,3}/)?.[0];
+            if (semver) versions.push(semver);
+        }
+
+        versions.push('1');
+        return this.uniqueValues(versions);
+    }
+
+    private getNeoForgeProbeCandidates(channelId: string, hintedVersion?: string): NeoForgeChannelDeclaration[] {
+        const shapes: Array<Omit<NeoForgeChannelDeclaration, 'id' | 'version'>> = [
+            { protocols: ['play'], flow: 'serverbound' },
+            { protocols: ['play'], flow: 'clientbound' },
+            { protocols: ['configuration', 'play'] },
+            { protocols: ['play'] },
+            { protocols: ['configuration'], flow: 'serverbound' },
+            { protocols: ['configuration'], flow: 'clientbound' },
+            { protocols: ['configuration'] },
+            { protocols: ['configuration', 'play'], flow: 'serverbound' },
+            { protocols: ['configuration', 'play'], flow: 'clientbound' }
+        ];
+
+        const candidates: NeoForgeChannelDeclaration[] = [];
+        const namespace = channelId.split(':', 1)[0];
+        const namespaceDefault = this.neoForgeProbeDefaultsByNamespace.get(namespace);
+        if (namespaceDefault) {
+            candidates.push({
+                id: channelId,
+                ...namespaceDefault
+            });
+        }
+
+        for (const version of this.getNeoForgeProbeVersionCandidates(channelId, hintedVersion)) {
+            for (const shape of shapes) {
+                candidates.push({
+                    id: channelId,
+                    version,
+                    protocols: shape.protocols,
+                    flow: shape.flow
+                });
+            }
+        }
+
+        const seen = new Set<string>();
+        return candidates.filter(candidate => {
+            const key = `${candidate.version}|${candidate.protocols.join('+')}|${candidate.flow || 'both'}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
+    private noteNeoForgeProbeProgress(failedChannelId: string) {
+        if (!this.lastNeoForgeFailureChannel || this.lastNeoForgeFailureChannel === failedChannelId) {
+            this.lastNeoForgeFailureChannel = failedChannelId;
+            return;
+        }
+
+        const previous = this.neoForgeProbeChannels.get(this.lastNeoForgeFailureChannel);
+        const accepted = previous?.candidates[previous.candidateIndex];
+        if (accepted) {
+            const namespace = accepted.id.split(':', 1)[0];
+            this.markNeoForgeChannelAccepted(accepted);
+            this.saveNeoForgeProbeCache();
+            this.log(LogLevel.DEBUG, `[NeoForge Probe] ${accepted.id} accepted; ${namespace}:* will try protocols=${accepted.protocols.join('+')}, flow=${accepted.flow || 'both'}, version=${accepted.version} first`);
+        }
+
+        this.lastNeoForgeFailureChannel = failedChannelId;
+    }
+
+    private handleNeoForgeProbeFailure(channelId: string, hintedVersion?: string): boolean {
+        if (!this.isNeoForgeProbeEnabled()) return false;
+        this.noteNeoForgeProbeProgress(channelId);
+
+        const existing = this.neoForgeProbeChannels.get(channelId);
+        if (existing) {
+            const current = existing.candidates[existing.candidateIndex];
+            if (hintedVersion && current.version !== hintedVersion) {
+                existing.candidates.splice(existing.candidateIndex + 1, 0, {
+                    ...current,
+                    version: hintedVersion
+                });
+            }
+
+            if (existing.candidateIndex + 1 >= existing.candidates.length) {
+                this.log(LogLevel.ERR, `[NeoForge Probe] Exhausted candidates for ${channelId}`);
+                return false;
+            }
+
+            existing.candidateIndex++;
+            const next = existing.candidates[existing.candidateIndex];
+            this.saveNeoForgeProbeCache();
+            this.log(LogLevel.WARN, `[NeoForge Probe] Retrying ${channelId} as version=${next.version}, protocols=${next.protocols.join('+')}, flow=${next.flow || 'both'}`);
+            return true;
+        }
+
+        const candidates = this.getNeoForgeProbeCandidates(channelId, hintedVersion);
+        if (candidates.length === 0) return false;
+        const maxProbeChannels = Number(this.clientOptions.neoforgeProbeMaxChannels ?? 128);
+        if (this.neoForgeProbeChannels.size >= maxProbeChannels) {
+            this.log(LogLevel.ERR, `[NeoForge Probe] Reached channel probe limit (${maxProbeChannels})`);
+            return false;
+        }
+
+        this.neoForgeProbeChannels.set(channelId, { candidates, candidateIndex: 0 });
+        const first = candidates[0];
+        this.saveNeoForgeProbeCache();
+        this.log(LogLevel.WARN, `[NeoForge Probe] Learned required channel ${channelId}; trying version=${first.version}, protocols=${first.protocols.join('+')}, flow=${first.flow || 'both'}`);
+        return true;
+    }
+
+    private collectNeoForgeSetupChannels(setup: Buffer | undefined): string[] {
+        if (!setup || setup.length === 0) return [];
+
+        try {
+            const offset = { val: 0 };
+            const channels = new Set<string>();
+            const protocolCount = this.readVarInt(setup, offset);
+
+            for (let i = 0; i < protocolCount && offset.val < setup.length; i++) {
+                this.readVarInt(setup, offset); // ConnectionProtocol ordinal
+                const channelCount = this.readVarInt(setup, offset);
+
+                for (let j = 0; j < channelCount && offset.val < setup.length; j++) {
+                    const mapKey = this.readString(setup, offset);
+                    const channelId = this.readString(setup, offset);
+                    this.readString(setup, offset); // negotiated version
+
+                    channels.add(mapKey);
+                    channels.add(channelId);
+                }
+            }
+
+            return Array.from(channels);
+        } catch (e) {
+            this.log(LogLevel.WARN, `[NeoForge] Failed to parse network setup channels: ${(e as Error).message}`);
+            return [];
+        }
+    }
+
+    private collectNeoForgeFailureChannels(payload: Buffer | undefined): string[] {
+        if (!payload || payload.length === 0) return [];
+
+        try {
+            const offset = { val: 0 };
+            const count = this.readVarInt(payload, offset);
+            if (count <= 0 || offset.val >= payload.length) return [];
+            return [this.readString(payload, offset)];
+        } catch (e) {
+            this.log(LogLevel.WARN, `[NeoForge] Failed to parse setup failure payload: ${(e as Error).message}`);
+            return [];
+        }
+    }
+
+    private collectNeoForgeFailureVersionHint(payload: Buffer | undefined): string | undefined {
+        if (!payload || payload.length === 0) return undefined;
+
+        const printable = payload
+            .toString('utf8')
+            .match(/[A-Za-z0-9_.:+-]{1,96}/g) ?? [];
+
+        return printable.find(value =>
+            /^\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9_.-]+)?$/.test(value)
+        );
+    }
+
+    private resolveMinecraftVersion(status: ServerStatus): string {
+        const versionFromName = status.version?.match(/\b\d+\.\d+(?:\.\d+)?\b/)?.[0];
+        if (versionFromName) {
+            try {
+                if (require('minecraft-data')(versionFromName)) return versionFromName;
+            } catch (e) {
+                this.log(LogLevel.DEBUG, `Unsupported advertised version name ${versionFromName}, falling back to protocol lookup`);
+            }
+        }
+
+        if (status.protocol) {
+            const minecraftData = require('minecraft-data');
+            const versions = minecraftData.postNettyVersionsByProtocolVersion?.pc?.[status.protocol] as { minecraftVersion: string }[] | undefined;
+            const matched = versions?.find(v => v.minecraftVersion === DEFAULT_MC_VERSION) ?? versions?.[0];
+            if (matched) return matched.minecraftVersion;
+        }
+
+        return DEFAULT_MC_VERSION;
+    }
+
+    private getForcedModLoader(): ServerStatus['modLoader'] | undefined {
+        const value = String(this.clientOptions.modLoader || '').toLowerCase();
+        if (value === 'neoforge' || value === 'forge' || value === 'vanilla' || value === 'modded') return value;
+        return undefined;
+    }
+
     private async ping(): Promise<ServerStatus> {
         return new Promise((resolve) => {
             mc.ping({ host: this.host, port: this.port }, (err, response: any) => {
@@ -172,7 +908,11 @@ export class MCClient extends EventEmitter {
                     resolve({ online: false, playersOnline: 0, playersMax: 0, isForge: false });
                 } else {
                     const res = response as any;
-                    const isForge = !!(res.forgeData || (res.version && res.version.name && res.version.name.includes('Forge')));
+                    const versionName = String(res.version?.name || '');
+                    const hasForgeData = !!res.forgeData;
+                    const isNeoForge = /neoforge/i.test(versionName);
+                    const isForge = !isNeoForge && (!!hasForgeData || /forge/i.test(versionName) || res.isModded === true);
+                    const modLoader: ServerStatus['modLoader'] = isNeoForge ? 'neoforge' : (isForge ? 'forge' : (hasForgeData ? 'modded' : 'vanilla'));
 
                     const mods = new Map<string, string>();
                     if (res.forgeData && res.forgeData.d) {
@@ -208,6 +948,7 @@ export class MCClient extends EventEmitter {
                             console.error('Failed to decode FML3 data:', e);
                         }
                     }
+                    this.serverModVersions = mods;
 
                     resolve({
                         online: true,
@@ -217,6 +958,8 @@ export class MCClient extends EventEmitter {
                         playersOnline: res.players?.online,
                         playersMax: res.players?.max,
                         isForge,
+                        isNeoForge,
+                        modLoader,
                         fmlVersion: res.forgeData ? 'FML3' : undefined,
                         mods: Array.from(mods.keys())
                     });
@@ -230,6 +973,12 @@ export class MCClient extends EventEmitter {
         this.cleanup();
 
         const status = await this.ping();
+        const forcedModLoader = this.getForcedModLoader();
+        if (forcedModLoader) {
+            status.modLoader = forcedModLoader;
+            status.isForge = forcedModLoader === 'forge';
+            status.isNeoForge = forcedModLoader === 'neoforge';
+        }
         this.status = status;
 
         if (!status.online) {
@@ -238,9 +987,14 @@ export class MCClient extends EventEmitter {
             return;
         }
 
-        console.log(`Connection attempt: ${status.isForge ? 'Forge (Handshake Tagging)' : 'Vanilla'}`);
+        const resolvedVersion = this.resolveMinecraftVersion(status);
+        const modLoader = status.modLoader || (status.isNeoForge ? 'neoforge' : (status.isForge ? 'forge' : 'vanilla'));
+        console.log(`Connection attempt: ${modLoader} (${resolvedVersion})`);
+        this.loadNeoForgeProbeCache(resolvedVersion, modLoader, status.protocol);
+        this.neoForgePlayCacheSaved = false;
+        this.configureYggdrasilJoinThrottle(modLoader);
 
-        // FML3 Marker for 1.20.1+
+        // FML3 marker for modern Forge. NeoForge 1.21.1 uses configuration custom payload negotiation below.
         const fmlMarker = '\0FML3\0';
         const serverHost = status.isForge ? `${this.host}${fmlMarker}` : this.host;
 
@@ -248,7 +1002,7 @@ export class MCClient extends EventEmitter {
             host: this.host,
             port: this.port,
             username: this.username,
-            version: status.version || '1.20.1',
+            version: resolvedVersion,
             serverHost: this.host, // Use clean host initially
             auth: this.authType,
             profilesFolder: './.minecraft_auth', // Enable built-in auth caching
@@ -299,22 +1053,131 @@ export class MCClient extends EventEmitter {
                 // console.log(`[Plugin] Sending wrapped response ID ${params.messageId}, length: ${params.data.length}, data: ${dataHex}...`);
             }
 
+            const outgoingSize = this.estimatePacketSize(String(packetName), params);
+            if (packetName === 'custom_payload') {
+                this.traceCustomPayload('C->S', String(this.client?.state), params, outgoingSize);
+            } else {
+                this.tracePacket('C->S', String(this.client?.state), String(packetName), outgoingSize);
+            }
             return oldWrite.call(this.client, packetName, params);
         };
 
-        this.client.on('packet', (data, meta) => {
+        this.client.on('packet', (data, meta, buffer?: Buffer, fullBuffer?: Buffer) => {
+            if (meta.name === 'custom_payload') {
+                this.traceCustomPayload('S->C', String(this.client?.state), data, fullBuffer?.length ?? buffer?.length);
+            } else {
+                this.tracePacket('S->C', String(this.client?.state), String(meta.name), fullBuffer?.length ?? buffer?.length);
+            }
+
+            if (meta.name === 'ping' && String(this.client?.state) === 'configuration') {
+                this.client?.write('pong', { id: (data as any).id });
+                this.log(LogLevel.DEBUG, `[Config] Replied pong ${String((data as any).id)}`);
+                return;
+            }
+
+            if (!this.neoForgePlayCacheSaved && modLoader === 'neoforge' && String(this.client?.state) === 'play') {
+                this.neoForgePlayCacheSaved = true;
+                this.markAllNeoForgeProbeChannelsAccepted();
+                this.log(LogLevel.INFO, '[NeoForge Probe] Negotiation reached play state; cached active probe declarations');
+            }
+
             if (meta.name === 'disconnect' || meta.name === 'kick_disconnect') {
                 this.log(LogLevel.ERR, `Disconnected: ${JSON.stringify(data)}`);
             }
             // Safe debug logging for play state to catch player disconnects
             const noise = ['keep_alive', 'update_time', 'rel_entity_move', 'entity_metadata', 'map_chunk', 'custom_payload', 'world_event', 'sound_effect', 'entity_teleport', 'entity_velocity'];
             if (this.client?.state === 'play' && !noise.includes(meta.name)) {
-                this.log(LogLevel.DEBUG, `Packet: ${meta.name}`);
-                try {
-                    const dataStr = data ? JSON.stringify(data).slice(0, 150) : 'undefined';
-                    this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): ${dataStr}`);
-                } catch (e) {
-                    this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): [JSON Error]`);
+                if (this.logLevel < LogLevel.TRACE) {
+                    this.log(LogLevel.DEBUG, `Packet: ${meta.name}`);
+                    try {
+                        const dataStr = data ? JSON.stringify(data).slice(0, 150) : 'undefined';
+                        this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): ${dataStr}`);
+                    } catch (e) {
+                        this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): [JSON Error]`);
+                    }
+                }
+            }
+        });
+
+        this.client.on('custom_payload', (packet) => {
+            const client = this.client;
+            const channel = packet.channel;
+            if (!client || String(client.state) !== 'configuration') return;
+
+            if (channel === 'c:version') {
+                client.write('custom_payload', {
+                    channel: 'c:version',
+                    data: this.createNeoForgeCommonVersionPayload()
+                });
+                this.log(LogLevel.DEBUG, '[NeoForge] Replied c:version with common network version 1');
+            } else if (channel === 'c:register') {
+                client.write('custom_payload', {
+                    channel: 'c:register',
+                    data: this.createNeoForgeCommonRegisterPayload()
+                });
+                this.log(LogLevel.DEBUG, '[NeoForge] Replied c:register with no common play channels');
+            } else if (channel === 'neoforge:register') {
+                const queryPayload = this.createNeoForgeModdedNetworkQueryPayload();
+                client.write('custom_payload', {
+                    channel: 'neoforge:register',
+                    data: queryPayload
+                });
+                this.log(LogLevel.DEBUG, `[NeoForge] Sent ${this.getNeoForgeChannelDeclarations().length} configured modded channel declarations (${queryPayload.length} bytes)`);
+            } else if (channel === 'neoforge:network') {
+                const setupChannels = this.collectNeoForgeSetupChannels(packet.data as Buffer | undefined);
+                const registeredChannels = Array.from(new Set([...NEOFORGE_INITIAL_CHANNELS, ...setupChannels]));
+                client.write('custom_payload', {
+                    channel: 'minecraft:register',
+                    data: this.writeDinnerboneChannels(registeredChannels)
+                });
+                this.log(LogLevel.DEBUG, `[NeoForge] Registered ${registeredChannels.length} negotiated channels`);
+            } else if (channel === 'minecraft:brand') {
+                client.write('custom_payload', {
+                    channel: 'minecraft:brand',
+                    data: this.writeString('mcplayerlistchecker')
+                });
+                this.log(LogLevel.DEBUG, '[Config] Sent client brand');
+            } else if (channel === 'neoforge:frozen_registry_sync_completed') {
+                client.write('custom_payload', {
+                    channel: 'neoforge:frozen_registry_sync_completed',
+                    data: Buffer.alloc(0)
+                });
+                this.log(LogLevel.DEBUG, '[NeoForge] Acknowledged frozen registry sync completion');
+            } else if (channel === 'neoforge:known_registry_data_maps') {
+                client.write('custom_payload', {
+                    channel: 'neoforge:known_registry_data_maps_reply',
+                    data: this.writeVarInt(0)
+                });
+                this.log(LogLevel.DEBUG, '[NeoForge] Replied with no known registry data maps');
+            } else if (channel === 'neoforge:feature_flags') {
+                client.write('custom_payload', {
+                    channel: 'neoforge:feature_flags_ack',
+                    data: Buffer.alloc(0)
+                });
+                this.log(LogLevel.DEBUG, '[NeoForge] Acknowledged NeoForge feature flags');
+            } else if (channel === 'neoforge:extensible_enum_data') {
+                client.write('custom_payload', {
+                    channel: 'neoforge:extensible_enum_ack',
+                    data: Buffer.alloc(0)
+                });
+                this.log(LogLevel.DEBUG, '[NeoForge] Acknowledged extensible enum data');
+            } else if (channel === 'fabric:accepted_attachments_v1') {
+                client.write('custom_payload', {
+                    channel: 'fabric:accepted_attachments_v1',
+                    data: this.writeVarInt(0)
+                });
+                this.log(LogLevel.DEBUG, '[Fabric] Replied with no accepted attachments');
+            } else if (channel === 'neoforge:modded_network_setup_failed') {
+                const failures = this.collectNeoForgeFailureChannels(packet.data as Buffer | undefined);
+                const versionHint = this.collectNeoForgeFailureVersionHint(packet.data as Buffer | undefined);
+                const probeUpdated = failures.some(failure => this.handleNeoForgeProbeFailure(failure, versionHint));
+                const suffix = failures.length > 0 ? ` Missing/incompatible channel: ${failures.join(', ')}` : '';
+                if (probeUpdated) {
+                    this.pendingNeoForgeProbeReconnect = true;
+                    const hint = versionHint ? ` Version hint: ${versionHint}.` : '';
+                    this.log(LogLevel.WARN, `[NeoForge] Server rejected modded network negotiation.${suffix}${hint} Probe will retry in ${this.getNeoForgeProbeRetryDelayMs()}ms.`);
+                } else {
+                    this.log(LogLevel.ERR, `[NeoForge] Server rejected modded network negotiation.${suffix}`);
                 }
             }
         });
@@ -500,7 +1363,7 @@ export class MCClient extends EventEmitter {
             }
         });
 
-        // 1.20.1 Forge specific packet for removal
+        // Modern Forge/NeoForge packet for removal
         this.client.on('player_remove', (packet) => {
             const { players } = packet;
             this.log(LogLevel.DEBUG, `player_remove received: ${JSON.stringify(players)}`);
@@ -537,7 +1400,7 @@ export class MCClient extends EventEmitter {
             }
         });
 
-        // Chat parsing for 1.20.1 (Modern and Legacy)
+        // Chat parsing for modern versions (Modern and Legacy)
         this.client.on('system_chat', (packet) => {
             try {
                 const content = typeof packet.content === 'string' ? JSON.parse(packet.content) : packet.content;
@@ -577,7 +1440,7 @@ export class MCClient extends EventEmitter {
 
         this.client.on('end', (reason) => {
             this.log(LogLevel.INFO, `Disconnected: ${reason}`);
-            this.reconnectTimeout = setTimeout(() => this.connect(), 5000);
+            this.scheduleReconnect(DEFAULT_RECONNECT_DELAY_MS);
         });
 
         this.client.on('error', (err: any) => {
@@ -589,11 +1452,11 @@ export class MCClient extends EventEmitter {
             }
             console.error('Client Error:', err);
             this.log(LogLevel.ERR, `Client Error: ${err.message}`);
-            this.reconnectTimeout = setTimeout(() => this.connect(), 5000);
+            this.scheduleReconnect(DEFAULT_RECONNECT_DELAY_MS);
         });
 
         this.client.on('success', (packet) => {
-            this.log(LogLevel.INFO, 'Logged in to Forge server!');
+            this.log(LogLevel.INFO, `Logged in to ${modLoader} server!`);
             if (this.client) {
                 this.username = this.client.username;
                 this.botUuid = packet.uuid || this.client.uuid; // Capture bot's own UUID
