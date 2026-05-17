@@ -5,6 +5,7 @@ import { MCClient, Player } from './mcClient';
 
 export function startApiServer(mcClient: MCClient, port: number = 3000) {
     const app = express();
+    app.use(express.json({ limit: '16kb' }));
     const server = createServer(app);
     const wss = new Server({ server });
 
@@ -24,6 +25,35 @@ export function startApiServer(mcClient: MCClient, port: number = 3000) {
         const status: any = { ...mcClient.getStatus() };
         delete status.mods;
         res.json(status);
+    });
+
+    app.post('/chat', (req, res) => {
+        const message = typeof req.body?.message === 'string' ? req.body.message : '';
+        if (!message) {
+            return res.status(400).json({ ok: false, error: 'message must be a non-empty string' });
+        }
+        if (message.startsWith('/')) {
+            return res.status(400).json({ ok: false, error: 'use /command endpoint to send commands' });
+        }
+        try {
+            mcClient.sendChat(message);
+            res.json({ ok: true });
+        } catch (e) {
+            res.status(503).json({ ok: false, error: (e as Error).message });
+        }
+    });
+
+    app.post('/command', (req, res) => {
+        const command = typeof req.body?.command === 'string' ? req.body.command : '';
+        if (!command) {
+            return res.status(400).json({ ok: false, error: 'command must be a non-empty string' });
+        }
+        try {
+            mcClient.sendCommand(command);
+            res.json({ ok: true });
+        } catch (e) {
+            res.status(503).json({ ok: false, error: (e as Error).message });
+        }
     });
 
     wss.on('connection', (ws) => {

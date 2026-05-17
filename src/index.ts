@@ -73,6 +73,12 @@ async function bootstrap() {
     if (config.minecraftSessionJoinRateLimitBackoffMs !== undefined) mcClient.clientOptions.minecraftSessionJoinRateLimitBackoffMs = config.minecraftSessionJoinRateLimitBackoffMs;
     if (config.neoforgeChannels) mcClient.clientOptions.neoforgeChannels = config.neoforgeChannels;
     if (config.hideErrors !== undefined) mcClient.clientOptions.hideErrors = config.hideErrors;
+    if (config.tpsFallbackEnabled !== undefined) mcClient.clientOptions.tpsFallbackEnabled = config.tpsFallbackEnabled;
+    if (config.tpsFallbackIdleMs !== undefined) mcClient.clientOptions.tpsFallbackIdleMs = config.tpsFallbackIdleMs;
+    if (config.tpsFallbackCheckIntervalMs !== undefined) mcClient.clientOptions.tpsFallbackCheckIntervalMs = config.tpsFallbackCheckIntervalMs;
+    if (config.tpsFallbackCooldownMs !== undefined) mcClient.clientOptions.tpsFallbackCooldownMs = config.tpsFallbackCooldownMs;
+    if (config.tpsFallbackResponseWindowMs !== undefined) mcClient.clientOptions.tpsFallbackResponseWindowMs = config.tpsFallbackResponseWindowMs;
+    if (config.tpsFallbackCommand !== undefined) mcClient.clientOptions.tpsFallbackCommand = config.tpsFallbackCommand;
 
     if (authType === 'microsoft') {
         mcClient.on('connected', () => {

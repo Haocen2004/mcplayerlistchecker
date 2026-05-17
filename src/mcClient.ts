@@ -11,6 +11,10 @@ const DEFAULT_NEOFORGE_PROBE_RETRY_DELAY_MS = 1000;
 const DEFAULT_NEOFORGE_PROBE_MAX_CHANNELS = 1024;
 const DEFAULT_MINECRAFT_SESSION_JOIN_MIN_INTERVAL_MS = 3000;
 const DEFAULT_MINECRAFT_SESSION_JOIN_RATE_LIMIT_BACKOFF_MS = 15000;
+const DEFAULT_TPS_FALLBACK_IDLE_MS = 30_000;
+const DEFAULT_TPS_FALLBACK_CHECK_INTERVAL_MS = 10_000;
+const DEFAULT_TPS_FALLBACK_RESPONSE_WINDOW_MS = 5_000;
+const DEFAULT_TPS_FALLBACK_MIN_COOLDOWN_MS = 60_000;
 const NEOFORGE_COMMON_NETWORK_VERSION = 1;
 const NEOFORGE_INITIAL_CHANNELS = [
     'minecraft:register',
@@ -111,6 +115,10 @@ export class MCClient extends EventEmitter {
     private neoForgeProbeCacheModLoader: string | null = null;
     private neoForgePlayCacheSaved = false;
     private pendingNeoForgeProbeReconnect = false;
+    private lastTpsUpdateAt = 0;
+    private tpsFallbackTimer: NodeJS.Timeout | null = null;
+    private tpsCommandPendingUntil = 0;
+    private tpsCommandCooldownUntil = 0;
     public clientOptions: any = {};
 
     constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang', compressionType: CompressionType = 'zlib') {
@@ -200,26 +208,95 @@ export class MCClient extends EventEmitter {
         return Buffer.from(packageData.slice(0, size));
     }
 
-    private extractTextFromComponent(obj: any): string {
-        if (!obj) return '';
-        if (typeof obj === 'string') return obj;
+    private isNbtTagged(obj: any): boolean {
+        return !!obj && typeof obj === 'object'
+            && typeof obj.type === 'string'
+            && 'value' in obj
+            && ['compound', 'list', 'string', 'byte', 'short', 'int', 'long', 'float', 'double', 'byteArray', 'intArray', 'longArray'].includes(obj.type);
+    }
 
-        let text = obj.text || '';
-        if (obj.extra && Array.isArray(obj.extra)) {
+    // 1.20.5+ uses NBT-encoded text components on the wire (prismarine-nbt shape:
+    // { type: 'compound', value: { text: { type: 'string', value: '...' }, extra: { type: 'list', value: { type, value: [...] } } } }).
+    // Flatten that back into a plain JSON-style component object so the rest of the extractor can operate uniformly.
+    private simplifyNbtComponent(obj: any): any {
+        if (!this.isNbtTagged(obj)) return obj;
+        const type = obj.type;
+        const value = obj.value;
+        if (type === 'compound') {
+            const out: any = {};
+            for (const key of Object.keys(value || {})) {
+                out[key] = this.simplifyNbtComponent(value[key]);
+            }
+            return out;
+        }
+        if (type === 'list') {
+            const items = Array.isArray(value?.value) ? value.value : [];
+            const innerType = value?.type;
+            return items.map((v: any) => this.simplifyNbtComponent(innerType ? { type: innerType, value: v } : v));
+        }
+        return value;
+    }
+
+    private extractTextFromComponent(obj: any): string {
+        if (obj === null || obj === undefined) return '';
+        if (typeof obj === 'string') {
+            const trimmed = obj.trim();
+            if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
+                try { return this.extractTextFromComponent(JSON.parse(obj)); } catch { return obj; }
+            }
+            return obj;
+        }
+        if (typeof obj !== 'object') return String(obj);
+        if (Array.isArray(obj)) {
+            return obj.map(e => this.extractTextFromComponent(e)).join('');
+        }
+        if (this.isNbtTagged(obj)) {
+            return this.extractTextFromComponent(this.simplifyNbtComponent(obj));
+        }
+
+        let text = typeof obj.text === 'string' ? obj.text : '';
+        if (obj.translate) {
+            const args: string[] = Array.isArray(obj.with) ? obj.with.map((w: any) => this.extractTextFromComponent(w)) : [];
+            text += this.formatTranslate(obj.translate, args);
+        }
+        if (Array.isArray(obj.extra)) {
             for (const e of obj.extra) {
                 text += this.extractTextFromComponent(e);
             }
         }
-        if (obj.translate) {
-            // Very basic translation support (just joining parts)
-            text += obj.translate;
-            if (obj.with && Array.isArray(obj.with)) {
-                for (const w of obj.with) {
-                    text += ' ' + this.extractTextFromComponent(w);
-                }
-            }
-        }
         return text;
+    }
+
+    // Renders a handful of well-known vanilla translate keys so chat messages aren't
+    // reduced to "chat.type.text sender " when the client has no language file loaded.
+    // Anything we don't recognise falls back to "<key> arg1 arg2 ..." (the previous
+    // behaviour), which is what the TPS fallback parser relies on.
+    private formatTranslate(key: string, args: string[]): string {
+        const a = (i: number) => args[i] ?? '';
+        switch (key) {
+            case 'chat.type.text':
+            case 'chat.type.text.narrate':
+                return `<${a(0)}> ${a(1)}`;
+            case 'chat.type.announcement':
+                return `[${a(0)}] ${a(1)}`;
+            case 'chat.type.emote':
+                return `* ${a(0)} ${a(1)}`;
+            case 'chat.type.admin':
+                return `[${a(0)}: ${a(1)}]`;
+            case 'chat.type.team.text':
+            case 'chat.type.team.sent':
+                return `${a(0)} <${a(1)}> ${a(2)}`;
+            case 'multiplayer.player.joined':
+                return `${a(0)} joined the game`;
+            case 'multiplayer.player.left':
+                return `${a(0)} left the game`;
+            case 'commands.message.display.incoming':
+                return `${a(0)} whispers to you: ${a(1)}`;
+            case 'commands.message.display.outgoing':
+                return `you whisper to ${a(0)}: ${a(1)}`;
+            default:
+                return args.length > 0 ? `${key} ${args.join(' ')}` : key;
+        }
     }
 
     private readVarInt(buf: Buffer, offset: { val: number }): number {
@@ -1401,8 +1478,7 @@ export class MCClient extends EventEmitter {
         this.client.on('playerlist_header', (packet) => {
             if (packet.footer) {
                 try {
-                    const footerObj = typeof packet.footer === 'string' ? JSON.parse(packet.footer) : packet.footer;
-                    const textContent = this.extractTextFromComponent(footerObj).replace(/§[0-9a-fk-or]/g, '');
+                    const textContent = this.extractTextFromComponent(packet.footer).replace(/§[0-9a-fk-or]/g, '');
                     this.log(LogLevel.DEBUG, `Flattened Footer: ${textContent}`);
 
                     const tpsMatch = textContent.match(/TPS[:\s]*([\d.]+)/i);
@@ -1412,6 +1488,7 @@ export class MCClient extends EventEmitter {
                     if (msptMatch) this.status.mspt = msptMatch[1];
 
                     if (tpsMatch || msptMatch) {
+                        this.lastTpsUpdateAt = Date.now();
                         this.log(LogLevel.DEBUG, `Extracted from footer - TPS: ${this.status.tps}, MSPT: ${this.status.mspt}`);
                         import('./db').then(db => db.saveHistory({
                             tps: this.status.tps || '0',
@@ -1427,39 +1504,52 @@ export class MCClient extends EventEmitter {
         // Chat parsing for modern versions (Modern and Legacy)
         this.client.on('system_chat', (packet) => {
             try {
-                const content = typeof packet.content === 'string' ? JSON.parse(packet.content) : packet.content;
-                const text = this.extractTextFromComponent(content).replace(/§[0-9a-fk-or]/g, '');
+                const text = this.extractTextFromComponent(packet.content).replace(/§[0-9a-fk-or]/g, '');
+                this.tryConsumeTpsCommandResponse(text);
                 this.log(LogLevel.INFO, `[Chat] (System) ${text}`);
                 this.emit('chat', { sender: 'System', message: text });
-            } catch (e) { }
+            } catch (e) {
+                this.log(LogLevel.DEBUG, `[Chat] system_chat parse error: ${(e as Error).message}`);
+            }
         });
 
         this.client.on('player_chat', (packet) => {
             try {
                 const senderUuid = packet.senderUuid;
-                const senderNameComp = packet.senderName ? (typeof packet.senderName === 'string' ? JSON.parse(packet.senderName) : packet.senderName) : null;
+                // 1.21.1 renames `senderName`/`unsignedContent` to `networkName`/`unsignedChatContent`
+                // and ships them as anonymous NBT instead of JSON strings.
+                const senderNameComp = packet.networkName ?? packet.senderName ?? null;
 
                 let name = 'Unknown';
                 if (senderNameComp) {
                     name = this.extractTextFromComponent(senderNameComp).replace(/§[0-9a-fk-or]/g, '');
-                } else if (senderUuid && this.uuidToName.has(senderUuid)) {
+                }
+                if (!name && senderUuid && this.uuidToName.has(senderUuid)) {
                     name = this.uuidToName.get(senderUuid)!;
                 }
+                if (!name) name = 'Unknown';
 
-                let message = packet.unsignedContent ? this.extractTextFromComponent(typeof packet.unsignedContent === 'string' ? JSON.parse(packet.unsignedContent) : packet.unsignedContent) : packet.plainMessage;
-                const cleanMsg = message.replace(/§[0-9a-fk-or]/g, '');
+                const unsigned = packet.unsignedChatContent ?? packet.unsignedContent;
+                let message = unsigned !== undefined && unsigned !== null
+                    ? this.extractTextFromComponent(unsigned)
+                    : (packet.plainMessage ?? '');
+                const cleanMsg = String(message).replace(/§[0-9a-fk-or]/g, '');
                 this.log(LogLevel.INFO, `[Chat] <${name}> ${cleanMsg}`);
                 this.emit('chat', { sender: name, message: cleanMsg });
-            } catch (e) { }
+            } catch (e) {
+                this.log(LogLevel.DEBUG, `[Chat] player_chat parse error: ${(e as Error).message}`);
+            }
         });
 
         this.client.on('chat', (packet) => {
             try {
-                const message = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
-                const text = this.extractTextFromComponent(message).replace(/§[0-9a-fk-or]/g, '');
+                const text = this.extractTextFromComponent(packet.message).replace(/§[0-9a-fk-or]/g, '');
+                this.tryConsumeTpsCommandResponse(text);
                 this.log(LogLevel.INFO, `[Chat] ${text}`);
                 this.emit('chat', { sender: 'System', message: text });
-            } catch (e) { }
+            } catch (e) {
+                this.log(LogLevel.DEBUG, `[Chat] legacy chat parse error: ${(e as Error).message}`);
+            }
         });
 
         this.client.on('end', (reason) => {
@@ -1486,16 +1576,188 @@ export class MCClient extends EventEmitter {
                 this.botUuid = packet.uuid || this.client.uuid; // Capture bot's own UUID
                 this.log(LogLevel.INFO, `BOT Username: ${this.username}, UUID: ${this.botUuid}`);
             }
+            this.lastTpsUpdateAt = 0;
+            this.tpsCommandPendingUntil = 0;
+            this.tpsCommandCooldownUntil = 0;
+            this.startTpsFallbackTimer();
             this.emit('connected');
         });
     }
 
     private cleanup() {
         this.players.clear();
+        this.stopTpsFallbackTimer();
+        this.tpsCommandPendingUntil = 0;
+        this.pendingTpsDimensionResult = null;
         if (this.client) {
             this.client.removeAllListeners();
             this.client = null;
         }
+    }
+
+    private startTpsFallbackTimer() {
+        this.stopTpsFallbackTimer();
+        if (this.clientOptions?.tpsFallbackEnabled === false) return;
+        const checkInterval = Number(this.clientOptions?.tpsFallbackCheckIntervalMs ?? DEFAULT_TPS_FALLBACK_CHECK_INTERVAL_MS);
+        this.tpsFallbackTimer = setInterval(() => this.evaluateTpsFallback(), checkInterval);
+    }
+
+    private stopTpsFallbackTimer() {
+        if (this.tpsFallbackTimer) {
+            clearInterval(this.tpsFallbackTimer);
+            this.tpsFallbackTimer = null;
+        }
+    }
+
+    private evaluateTpsFallback() {
+        if (!this.client || !this.username) return;
+        const now = Date.now();
+        // If a previous fallback round timed out without an "overall" line, commit the
+        // last per-dimension reading we buffered so the watchdog has *something* to use.
+        if (this.pendingTpsDimensionResult && now > this.tpsCommandPendingUntil) {
+            this.flushPendingTpsDimensionResult();
+        }
+        const idleThreshold = Number(this.clientOptions?.tpsFallbackIdleMs ?? DEFAULT_TPS_FALLBACK_IDLE_MS);
+        const cooldown = Number(this.clientOptions?.tpsFallbackCooldownMs ?? DEFAULT_TPS_FALLBACK_MIN_COOLDOWN_MS);
+        if (now < this.tpsCommandCooldownUntil) return;
+        if (now < this.tpsCommandPendingUntil) return;
+        const lastUpdate = this.lastTpsUpdateAt;
+        const idleMs = lastUpdate === 0 ? Number.POSITIVE_INFINITY : now - lastUpdate;
+        if (idleMs < idleThreshold) return;
+
+        const command = String(this.clientOptions?.tpsFallbackCommand ?? 'neoforge tps').replace(/^\/+/, '');
+        try {
+            this.log(LogLevel.DEBUG, `[TPS Fallback] No TPS update for ${idleMs === Infinity ? 'ever' : `${Math.round(idleMs / 1000)}s`}, requesting via /${command}`);
+            this.sendCommand(command);
+            const responseWindow = Number(this.clientOptions?.tpsFallbackResponseWindowMs ?? DEFAULT_TPS_FALLBACK_RESPONSE_WINDOW_MS);
+            this.tpsCommandPendingUntil = now + responseWindow;
+            this.tpsCommandCooldownUntil = now + Math.max(cooldown, responseWindow);
+        } catch (e) {
+            this.log(LogLevel.WARN, `[TPS Fallback] Failed to send command: ${(e as Error).message}`);
+            this.tpsCommandCooldownUntil = now + cooldown;
+        }
+    }
+
+    // Parses TPS / MSPT from chat output of `/neoforge tps` (and the older `/forge tps`).
+    // The bot may receive either a rendered English line:
+    //   "Overall: 20.000 TPS (19.2 ms/tick)"
+    //   "minecraft:overworld: 20.000 TPS (4.2 ms/tick)"
+    // or — when the language file isn't loaded client-side — the raw translate key
+    // followed by its arguments, joined by spaces (this is what extractTextFromComponent
+    // produces for an un-localised translate component):
+    //   "commands.neoforge.tps.overall 20.000 19.246"
+    //   "commands.neoforge.tps.dimension dimension.minecraft.overworld 20.000 18.468"
+    // Within a single fallback round we only commit on the "overall" line, but we
+    // remember the most recent dimension line so we can fall back to it if no overall
+    // arrives before the response window expires.
+    private pendingTpsDimensionResult: { tps: string; mspt?: string } | null = null;
+
+    private tryConsumeTpsCommandResponse(text: string) {
+        if (!text) return;
+        const now = Date.now();
+        if (now > this.tpsCommandPendingUntil) {
+            // Response window over: commit any pending dimension reading we've buffered.
+            this.flushPendingTpsDimensionResult();
+            return;
+        }
+
+        const trimmed = text.trim();
+        let tps: string | undefined;
+        let mspt: string | undefined;
+        let isOverall = false;
+
+        // Translate-key variants (non-localised).
+        const overallKey = trimmed.match(/^commands\.(?:neo)?forge\.tps\.overall\s+([\d.]+)\s+([\d.]+)/i);
+        if (overallKey) {
+            tps = overallKey[1];
+            mspt = overallKey[2];
+            isOverall = true;
+        } else {
+            const dimKey = trimmed.match(/^commands\.(?:neo)?forge\.tps\.dimension\s+\S+\s+([\d.]+)\s+([\d.]+)/i);
+            if (dimKey) {
+                tps = dimKey[1];
+                mspt = dimKey[2];
+            }
+        }
+
+        // Localised variants. NeoForge: "Overall: 20.000 TPS (19.2 ms/tick)"
+        // Older Forge wording: "Overall: Mean tick time: 49.8 ms. Mean TPS: 20.000"
+        if (!tps) {
+            if (/\bOverall\b/i.test(trimmed)) isOverall = true;
+            const tpsParen = trimmed.match(/([\d.]+)\s*TPS\s*\(\s*([\d.]+)\s*ms/i);
+            if (tpsParen) {
+                tps = tpsParen[1];
+                mspt = tpsParen[2];
+            } else {
+                const meanTps = trimmed.match(/Mean\s+TPS\s*[:=]?\s*([\d.]+)/i) || trimmed.match(/\bTPS\s*[:=]\s*([\d.]+)/i);
+                if (meanTps) {
+                    tps = meanTps[1];
+                    const meanMspt = trimmed.match(/Mean\s+tick\s+time\s*[:=]?\s*([\d.]+)/i) || trimmed.match(/\bMSPT\s*[:=]\s*([\d.]+)/i);
+                    if (meanMspt) mspt = meanMspt[1];
+                }
+            }
+        }
+
+        if (!tps) return;
+
+        if (isOverall) {
+            this.commitTpsResult(tps, mspt, true);
+            this.pendingTpsDimensionResult = null;
+            // Stop accepting more lines for this fallback round once we have the overall figure.
+            this.tpsCommandPendingUntil = 0;
+        } else {
+            // Buffer dimension lines; commit only if the response window expires without an "overall".
+            this.pendingTpsDimensionResult = { tps, mspt };
+        }
+    }
+
+    private flushPendingTpsDimensionResult() {
+        const pending = this.pendingTpsDimensionResult;
+        if (!pending) return;
+        this.pendingTpsDimensionResult = null;
+        this.commitTpsResult(pending.tps, pending.mspt, false);
+    }
+
+    private commitTpsResult(tps: string, mspt: string | undefined, isOverall: boolean) {
+        this.status.tps = tps;
+        if (mspt) this.status.mspt = mspt;
+        this.lastTpsUpdateAt = Date.now();
+        this.log(LogLevel.INFO, `[TPS Fallback] Captured TPS=${tps}${mspt ? ` MSPT=${mspt}` : ''}${isOverall ? ' (Overall)' : ''}`);
+        import('./db').then(db => db.saveHistory({
+            tps: this.status.tps || '0',
+            mspt: this.status.mspt || '0',
+            playerCount: this.players.size,
+            server: this.host
+        })).catch(() => {});
+    }
+
+    public sendChat(message: string): void {
+        if (!message || typeof message !== 'string') {
+            throw new Error('message must be a non-empty string');
+        }
+        if (message.length > 256) {
+            throw new Error('message exceeds 256 character limit');
+        }
+        if (!this.client) {
+            throw new Error('Not connected to server');
+        }
+        const send = (this.client as any).chat;
+        if (typeof send !== 'function') {
+            throw new Error('chat function not available on client');
+        }
+        send.call(this.client, message);
+        this.log(LogLevel.INFO, `[Chat] -> ${message}`);
+    }
+
+    public sendCommand(command: string): void {
+        if (!command || typeof command !== 'string') {
+            throw new Error('command must be a non-empty string');
+        }
+        const trimmed = command.replace(/^\/+/, '').trim();
+        if (!trimmed) {
+            throw new Error('command must be a non-empty string');
+        }
+        this.sendChat(`/${trimmed}`);
     }
 
     public getPlayers(): Player[] {

@@ -78,7 +78,7 @@ NeoForge 1.21.1 服务器如果要求额外的 mod payload，本程序会在 `ne
 如果你有真实 NeoForge 客户端，可以让客户端连接到本程序一次，直接采集客户端发送的 `neoforge:register` 全量 payload 声明并写入同一个 probe 缓存：
 
 ```bash
-npx ts-node src/index.ts --server-mode
+npm run server
 ```
 
 默认监听 `0.0.0.0:25566`。客户端进入服务器列表连接 `127.0.0.1:25566`，采集完成后程序会写入 `.neoforge_probe_cache.json`，随后继续完成 configuration 流程；之后正常 client 模式会按目标服务器 `host:port_协议版本` 的 hash 读取这些声明。
