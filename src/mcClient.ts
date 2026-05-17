@@ -253,11 +253,20 @@ export class MCClient extends EventEmitter {
         if (this.isNbtTagged(obj)) {
             return this.extractTextFromComponent(this.simplifyNbtComponent(obj));
         }
+        // NBT lists of compounds sometimes wrap a primitive entry as {"" : primitive}
+        // (this is how vanilla encodes a plain-string component inside a list of
+        // compounds, e.g. the message body in chat.type.text). Unwrap it so the
+        // rest of the extractor sees the actual primitive.
+        const keys = Object.keys(obj);
+        if (keys.length === 1 && keys[0] === '') {
+            return this.extractTextFromComponent((obj as any)['']);
+        }
 
         let text = typeof obj.text === 'string' ? obj.text : '';
         if (obj.translate) {
             const args: string[] = Array.isArray(obj.with) ? obj.with.map((w: any) => this.extractTextFromComponent(w)) : [];
-            text += this.formatTranslate(obj.translate, args);
+            const fallback = typeof obj.fallback === 'string' ? obj.fallback : undefined;
+            text += this.formatTranslate(obj.translate, args, fallback);
         }
         if (Array.isArray(obj.extra)) {
             for (const e of obj.extra) {
@@ -267,11 +276,13 @@ export class MCClient extends EventEmitter {
         return text;
     }
 
-    // Renders a handful of well-known vanilla translate keys so chat messages aren't
-    // reduced to "chat.type.text sender " when the client has no language file loaded.
-    // Anything we don't recognise falls back to "<key> arg1 arg2 ..." (the previous
-    // behaviour), which is what the TPS fallback parser relies on.
-    private formatTranslate(key: string, args: string[]): string {
+    // Renders a translate component. Preference order:
+    //   1. `fallback` string from the packet (server-supplied English template, e.g. "<%s> %s")
+    //   2. A handful of well-known vanilla keys hard-coded below
+    //   3. "<key> arg1 arg2 ..." — preserved so the TPS fallback parser can still recognise
+    //      commands.neoforge.tps.* lines if a server ever sends them without a fallback.
+    private formatTranslate(key: string, args: string[], fallback?: string): string {
+        if (fallback) return this.applyTranslateTemplate(fallback, args);
         const a = (i: number) => args[i] ?? '';
         switch (key) {
             case 'chat.type.text':
@@ -297,6 +308,17 @@ export class MCClient extends EventEmitter {
             default:
                 return args.length > 0 ? `${key} ${args.join(' ')}` : key;
         }
+    }
+
+    // Substitutes Minecraft-style format specifiers (%s, %1$s, %d) used in vanilla
+    // language templates. We treat any %... specifier as a positional %s; positional
+    // indices are 1-based when explicit, otherwise auto-incremented.
+    private applyTranslateTemplate(template: string, args: string[]): string {
+        let auto = 0;
+        return template.replace(/%(?:(\d+)\$)?[a-zA-Z]/g, (_match, idx) => {
+            const i = idx !== undefined ? parseInt(idx, 10) - 1 : auto++;
+            return args[i] ?? '';
+        });
     }
 
     private readVarInt(buf: Buffer, offset: { val: number }): number {
