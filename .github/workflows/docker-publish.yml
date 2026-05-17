@@ -10,25 +10,34 @@ jobs:
     build-and-push:
         runs-on: ubuntu-latest
 
+        # secrets 不能直接出现在 step 级别的 if 表达式里，所以先复制到 env，
+        # 后续 step 用 env.* 做存在性判断（未配置的 secret 会渲染为空字符串）。
+        env:
+            DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+            DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+            TENCENTCLOUD_REGISTRY: ${{ secrets.TENCENTCLOUD_REGISTRY }}
+            TENCENTCLOUD_NAMESPACE: ${{ secrets.TENCENTCLOUD_NAMESPACE }}
+            TENCENTCLOUD_USERNAME: ${{ secrets.TENCENTCLOUD_USERNAME }}
+            TENCENTCLOUD_PASSWORD: ${{ secrets.TENCENTCLOUD_PASSWORD }}
+
         steps:
             - name: Checkout code
               uses: actions/checkout@v4
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
-              # Buildx 支持更高级的缓存功能
 
             # ---------- Docker Hub ----------
             # 启用条件：同时配置了 DOCKERHUB_USERNAME 与 DOCKERHUB_TOKEN
             - name: Login to Docker Hub
-              if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+              if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
               uses: docker/login-action@v3
               with:
                   username: ${{ secrets.DOCKERHUB_USERNAME }}
                   password: ${{ secrets.DOCKERHUB_TOKEN }}
 
             - name: Build and push to Docker Hub
-              if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+              if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
               uses: docker/build-push-action@v5
               with:
                   context: .
@@ -45,7 +54,7 @@ jobs:
             #                              或  your-instance.tencentcloudcr.com
             #   TENCENTCLOUD_NAMESPACE = your-namespace
             - name: Login to Tencent Cloud Registry
-              if: ${{ secrets.TENCENTCLOUD_REGISTRY != '' && secrets.TENCENTCLOUD_NAMESPACE != '' && secrets.TENCENTCLOUD_USERNAME != '' && secrets.TENCENTCLOUD_PASSWORD != '' }}
+              if: ${{ env.TENCENTCLOUD_REGISTRY != '' && env.TENCENTCLOUD_NAMESPACE != '' && env.TENCENTCLOUD_USERNAME != '' && env.TENCENTCLOUD_PASSWORD != '' }}
               uses: docker/login-action@v3
               with:
                   registry: ${{ secrets.TENCENTCLOUD_REGISTRY }}
@@ -53,7 +62,7 @@ jobs:
                   password: ${{ secrets.TENCENTCLOUD_PASSWORD }}
 
             - name: Build and push to Tencent Cloud Registry
-              if: ${{ secrets.TENCENTCLOUD_REGISTRY != '' && secrets.TENCENTCLOUD_NAMESPACE != '' && secrets.TENCENTCLOUD_USERNAME != '' && secrets.TENCENTCLOUD_PASSWORD != '' }}
+              if: ${{ env.TENCENTCLOUD_REGISTRY != '' && env.TENCENTCLOUD_NAMESPACE != '' && env.TENCENTCLOUD_USERNAME != '' && env.TENCENTCLOUD_PASSWORD != '' }}
               uses: docker/build-push-action@v5
               with:
                   context: .
