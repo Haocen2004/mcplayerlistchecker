@@ -18,19 +18,46 @@ jobs:
               uses: docker/setup-buildx-action@v3
               # Buildx 支持更高级的缓存功能
 
+            # ---------- Docker Hub ----------
+            # 启用条件：同时配置了 DOCKERHUB_USERNAME 与 DOCKERHUB_TOKEN
             - name: Login to Docker Hub
+              if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
               uses: docker/login-action@v3
               with:
                   username: ${{ secrets.DOCKERHUB_USERNAME }}
                   password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-            - name: Build and push
+            - name: Build and push to Docker Hub
+              if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
               uses: docker/build-push-action@v5
               with:
                   context: .
                   push: true
-                  # 替换为你的镜像名称
                   tags: ${{ secrets.DOCKERHUB_USERNAME }}/mc-checker:latest
-                  # 使用 GitHub Actions 缓存来加速后续构建
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            # ---------- 腾讯云容器镜像服务 (TCR / CCR) ----------
+            # 启用条件：同时配置了 TENCENTCLOUD_REGISTRY、TENCENTCLOUD_NAMESPACE、
+            # TENCENTCLOUD_USERNAME、TENCENTCLOUD_PASSWORD。
+            # 例如：
+            #   TENCENTCLOUD_REGISTRY  = ccr.ccs.tencentyun.com
+            #                              或  your-instance.tencentcloudcr.com
+            #   TENCENTCLOUD_NAMESPACE = your-namespace
+            - name: Login to Tencent Cloud Registry
+              if: ${{ secrets.TENCENTCLOUD_REGISTRY != '' && secrets.TENCENTCLOUD_NAMESPACE != '' && secrets.TENCENTCLOUD_USERNAME != '' && secrets.TENCENTCLOUD_PASSWORD != '' }}
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ secrets.TENCENTCLOUD_REGISTRY }}
+                  username: ${{ secrets.TENCENTCLOUD_USERNAME }}
+                  password: ${{ secrets.TENCENTCLOUD_PASSWORD }}
+
+            - name: Build and push to Tencent Cloud Registry
+              if: ${{ secrets.TENCENTCLOUD_REGISTRY != '' && secrets.TENCENTCLOUD_NAMESPACE != '' && secrets.TENCENTCLOUD_USERNAME != '' && secrets.TENCENTCLOUD_PASSWORD != '' }}
+              uses: docker/build-push-action@v5
+              with:
+                  context: .
+                  push: true
+                  tags: ${{ secrets.TENCENTCLOUD_REGISTRY }}/${{ secrets.TENCENTCLOUD_NAMESPACE }}/mc-checker:latest
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
