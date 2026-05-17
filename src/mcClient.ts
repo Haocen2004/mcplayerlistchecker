@@ -8,6 +8,7 @@ import { applyCompression, CompressionType } from './compression';
 const DEFAULT_MC_VERSION = '1.21.1';
 const DEFAULT_RECONNECT_DELAY_MS = 5000;
 const DEFAULT_NEOFORGE_PROBE_RETRY_DELAY_MS = 1000;
+const DEFAULT_NEOFORGE_PROBE_MAX_CHANNELS = 1024;
 const DEFAULT_MINECRAFT_SESSION_JOIN_MIN_INTERVAL_MS = 3000;
 const DEFAULT_MINECRAFT_SESSION_JOIN_RATE_LIMIT_BACKOFF_MS = 15000;
 const NEOFORGE_COMMON_NETWORK_VERSION = 1;
@@ -591,6 +592,13 @@ export class MCClient extends EventEmitter {
             : DEFAULT_NEOFORGE_PROBE_RETRY_DELAY_MS;
     }
 
+    private getNeoForgeProbeMaxChannels(): number {
+        const configured = Number(this.clientOptions.neoforgeProbeMaxChannels);
+        return Number.isFinite(configured) && configured >= 0
+            ? configured
+            : DEFAULT_NEOFORGE_PROBE_MAX_CHANNELS;
+    }
+
     private getMinecraftSessionJoinMinIntervalMs(): number {
         const configured = Number(this.clientOptions.minecraftSessionJoinMinIntervalMs);
         return Number.isFinite(configured) && configured >= 0
@@ -718,8 +726,24 @@ export class MCClient extends EventEmitter {
         return this.uniqueValues(versions);
     }
 
+    private getNeoForgeProbeCandidateKey(channel: NeoForgeChannelDeclaration): string {
+        return `${channel.version}|${channel.protocols.join('+')}|${channel.flow || 'both'}|${channel.optional === true ? 'optional' : 'required'}`;
+    }
+
+    private extendNeoForgeProbeCandidates(channelId: string, state: NeoForgeProbeState, hintedVersion?: string): number {
+        const existing = new Set(state.candidates.map(candidate => this.getNeoForgeProbeCandidateKey(candidate)));
+        const additions = this.getNeoForgeProbeCandidates(channelId, hintedVersion)
+            .filter(candidate => !existing.has(this.getNeoForgeProbeCandidateKey(candidate)));
+
+        if (additions.length > 0) {
+            state.candidates.push(...additions);
+        }
+
+        return additions.length;
+    }
+
     private getNeoForgeProbeCandidates(channelId: string, hintedVersion?: string): NeoForgeChannelDeclaration[] {
-        const shapes: Array<Omit<NeoForgeChannelDeclaration, 'id' | 'version'>> = [
+        const shapes: Array<Omit<NeoForgeChannelDeclaration, 'id' | 'version' | 'optional'>> = [
             { protocols: ['play'], flow: 'serverbound' },
             { protocols: ['play'], flow: 'clientbound' },
             { protocols: ['configuration', 'play'] },
@@ -743,18 +767,21 @@ export class MCClient extends EventEmitter {
 
         for (const version of this.getNeoForgeProbeVersionCandidates(channelId, hintedVersion)) {
             for (const shape of shapes) {
-                candidates.push({
-                    id: channelId,
-                    version,
-                    protocols: shape.protocols,
-                    flow: shape.flow
-                });
+                for (const optional of [false, true]) {
+                    candidates.push({
+                        id: channelId,
+                        version,
+                        protocols: shape.protocols,
+                        flow: shape.flow,
+                        optional
+                    });
+                }
             }
         }
 
         const seen = new Set<string>();
         return candidates.filter(candidate => {
-            const key = `${candidate.version}|${candidate.protocols.join('+')}|${candidate.flow || 'both'}`;
+            const key = this.getNeoForgeProbeCandidateKey(candidate);
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
@@ -785,12 +812,9 @@ export class MCClient extends EventEmitter {
 
         const existing = this.neoForgeProbeChannels.get(channelId);
         if (existing) {
-            const current = existing.candidates[existing.candidateIndex];
-            if (hintedVersion && current.version !== hintedVersion) {
-                existing.candidates.splice(existing.candidateIndex + 1, 0, {
-                    ...current,
-                    version: hintedVersion
-                });
+            const addedCandidates = this.extendNeoForgeProbeCandidates(channelId, existing, hintedVersion);
+            if (addedCandidates > 0) {
+                this.log(LogLevel.DEBUG, `[NeoForge Probe] Expanded candidate set for ${channelId} by ${addedCandidates}`);
             }
 
             if (existing.candidateIndex + 1 >= existing.candidates.length) {
@@ -807,7 +831,7 @@ export class MCClient extends EventEmitter {
 
         const candidates = this.getNeoForgeProbeCandidates(channelId, hintedVersion);
         if (candidates.length === 0) return false;
-        const maxProbeChannels = Number(this.clientOptions.neoforgeProbeMaxChannels ?? 128);
+        const maxProbeChannels = this.getNeoForgeProbeMaxChannels();
         if (this.neoForgeProbeChannels.size >= maxProbeChannels) {
             this.log(LogLevel.ERR, `[NeoForge Probe] Reached channel probe limit (${maxProbeChannels})`);
             return false;
