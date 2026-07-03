@@ -119,6 +119,7 @@ export class MCClient extends EventEmitter {
     private tpsFallbackTimer: NodeJS.Timeout | null = null;
     private tpsCommandPendingUntil = 0;
     private tpsCommandCooldownUntil = 0;
+    private tpsCommandSuppressUntil = 0;
     public clientOptions: any = {};
 
     constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang', compressionType: CompressionType = 'zlib') {
@@ -1103,6 +1104,7 @@ export class MCClient extends EventEmitter {
             status.isNeoForge = forcedModLoader === 'neoforge';
         }
         this.status = status;
+        this.emitStatusUpdate();
 
         if (!status.online) {
             console.log('Server is offline, waiting 10s...');
@@ -1408,6 +1410,7 @@ export class MCClient extends EventEmitter {
             if (player) {
                 this.players.delete(targetUuid);
                 this.emit('playerLeave', player);
+                this.emitStatusUpdate();
                 this.log(LogLevel.INFO, `Player Left: ${player.username} (${targetUuid}) [via ${source}]`);
                 // Use botUuid for filtering
                 if (targetUuid !== this.botUuid) {
@@ -1448,6 +1451,7 @@ export class MCClient extends EventEmitter {
                             this.players.set(uuid, player);
                             this.uuidToName.set(uuid, username);
                             this.emit('playerJoin', player);
+                            this.emitStatusUpdate();
                             this.log(LogLevel.INFO, `Player Joined: ${username} (${uuid})`);
                             if (username !== this.username) {
                                 import('./db').then(db => db.saveLog({ type: 'join', uuid, username, server: this.host }));
@@ -1461,8 +1465,12 @@ export class MCClient extends EventEmitter {
                     const latency = item.latency ?? item.ping;
                     const player = this.players.get(uuid);
                     if (player) {
+                        const oldLatency = player.latency;
                         player.latency = latency || 0;
                         this.log(LogLevel.DEBUG, `Player Latency Updated: ${player.username} (${latency}ms)`);
+                        if (oldLatency !== player.latency) {
+                            this.emit('playerUpdate', { ...player });
+                        }
                     }
                 }
 
@@ -1512,6 +1520,7 @@ export class MCClient extends EventEmitter {
                     if (tpsMatch || msptMatch) {
                         this.lastTpsUpdateAt = Date.now();
                         this.log(LogLevel.DEBUG, `Extracted from footer - TPS: ${this.status.tps}, MSPT: ${this.status.mspt}`);
+                        this.emitStatusUpdate();
                         import('./db').then(db => db.saveHistory({
                             tps: this.status.tps || '0',
                             mspt: this.status.mspt || '0',
@@ -1527,7 +1536,11 @@ export class MCClient extends EventEmitter {
         this.client.on('system_chat', (packet) => {
             try {
                 const text = this.extractTextFromComponent(packet.content).replace(/§[0-9a-fk-or]/g, '');
-                this.tryConsumeTpsCommandResponse(text);
+                const suppressed = this.tryConsumeTpsCommandResponse(text);
+                if (suppressed) {
+                    this.log(LogLevel.DEBUG, `[TPS Fallback] Suppressed system chat response: ${text}`);
+                    return;
+                }
                 this.log(LogLevel.INFO, `[Chat] (System) ${text}`);
                 this.emit('chat', { sender: 'System', message: text });
             } catch (e) {
@@ -1566,7 +1579,11 @@ export class MCClient extends EventEmitter {
         this.client.on('chat', (packet) => {
             try {
                 const text = this.extractTextFromComponent(packet.message).replace(/§[0-9a-fk-or]/g, '');
-                this.tryConsumeTpsCommandResponse(text);
+                const suppressed = this.tryConsumeTpsCommandResponse(text);
+                if (suppressed) {
+                    this.log(LogLevel.DEBUG, `[TPS Fallback] Suppressed legacy chat response: ${text}`);
+                    return;
+                }
                 this.log(LogLevel.INFO, `[Chat] ${text}`);
                 this.emit('chat', { sender: 'System', message: text });
             } catch (e) {
@@ -1601,6 +1618,7 @@ export class MCClient extends EventEmitter {
             this.lastTpsUpdateAt = 0;
             this.tpsCommandPendingUntil = 0;
             this.tpsCommandCooldownUntil = 0;
+            this.tpsCommandSuppressUntil = 0;
             this.startTpsFallbackTimer();
             this.emit('connected');
         });
@@ -1610,6 +1628,7 @@ export class MCClient extends EventEmitter {
         this.players.clear();
         this.stopTpsFallbackTimer();
         this.tpsCommandPendingUntil = 0;
+        this.tpsCommandSuppressUntil = 0;
         this.pendingTpsDimensionResult = null;
         if (this.client) {
             this.client.removeAllListeners();
@@ -1653,6 +1672,7 @@ export class MCClient extends EventEmitter {
             this.sendCommand(command);
             const responseWindow = Number(this.clientOptions?.tpsFallbackResponseWindowMs ?? DEFAULT_TPS_FALLBACK_RESPONSE_WINDOW_MS);
             this.tpsCommandPendingUntil = now + responseWindow;
+            this.tpsCommandSuppressUntil = this.tpsCommandPendingUntil;
             this.tpsCommandCooldownUntil = now + Math.max(cooldown, responseWindow);
         } catch (e) {
             this.log(LogLevel.WARN, `[TPS Fallback] Failed to send command: ${(e as Error).message}`);
@@ -1674,13 +1694,16 @@ export class MCClient extends EventEmitter {
     // arrives before the response window expires.
     private pendingTpsDimensionResult: { tps: string; mspt?: string } | null = null;
 
-    private tryConsumeTpsCommandResponse(text: string) {
-        if (!text) return;
+    private tryConsumeTpsCommandResponse(text: string): boolean {
+        if (!text) return false;
         const now = Date.now();
-        if (now > this.tpsCommandPendingUntil) {
+        const withinPendingWindow = now <= this.tpsCommandPendingUntil;
+        const withinSuppressWindow = now <= this.tpsCommandSuppressUntil;
+
+        if (!withinPendingWindow) {
             // Response window over: commit any pending dimension reading we've buffered.
             this.flushPendingTpsDimensionResult();
-            return;
+            if (!withinSuppressWindow) return false;
         }
 
         const trimmed = text.trim();
@@ -1720,17 +1743,32 @@ export class MCClient extends EventEmitter {
             }
         }
 
-        if (!tps) return;
-
-        if (isOverall) {
-            this.commitTpsResult(tps, mspt, true);
-            this.pendingTpsDimensionResult = null;
-            // Stop accepting more lines for this fallback round once we have the overall figure.
-            this.tpsCommandPendingUntil = 0;
-        } else {
-            // Buffer dimension lines; commit only if the response window expires without an "overall".
-            this.pendingTpsDimensionResult = { tps, mspt };
+        if (!tps) {
+            return this.isLikelyTpsFallbackCommandFeedback(trimmed);
         }
+
+        if (withinPendingWindow) {
+            if (isOverall) {
+                this.commitTpsResult(tps, mspt, true);
+                this.pendingTpsDimensionResult = null;
+                // Stop parsing more readings for this fallback round once we have the overall figure.
+                // Keep tpsCommandSuppressUntil intact so trailing command output is still hidden from WS.
+                this.tpsCommandPendingUntil = 0;
+            } else {
+                // Buffer dimension lines; commit only if the response window expires without an "overall".
+                this.pendingTpsDimensionResult = { tps, mspt };
+            }
+        }
+
+        return true;
+    }
+
+    private isLikelyTpsFallbackCommandFeedback(text: string): boolean {
+        return /commands\.(?:neo)?forge\.tps\./i.test(text)
+            || /\b(?:TPS|MSPT|ms\/tick|Mean\s+tick\s+time)\b/i.test(text)
+            || /commands\.(?:generic|dispatcher)\./i.test(text)
+            || /\b(?:unknown|incomplete)\s+command\b/i.test(text)
+            || /\bpermission\b/i.test(text);
     }
 
     private flushPendingTpsDimensionResult() {
@@ -1745,12 +1783,17 @@ export class MCClient extends EventEmitter {
         if (mspt) this.status.mspt = mspt;
         this.lastTpsUpdateAt = Date.now();
         this.log(LogLevel.INFO, `[TPS Fallback] Captured TPS=${tps}${mspt ? ` MSPT=${mspt}` : ''}${isOverall ? ' (Overall)' : ''}`);
+        this.emitStatusUpdate();
         import('./db').then(db => db.saveHistory({
             tps: this.status.tps || '0',
             mspt: this.status.mspt || '0',
             playerCount: this.players.size,
             server: this.host
         })).catch(() => {});
+    }
+
+    private emitStatusUpdate() {
+        this.emit('statusUpdate', this.getStatus());
     }
 
     public sendChat(message: string): void {
