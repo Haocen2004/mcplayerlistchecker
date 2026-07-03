@@ -377,6 +377,24 @@ export class MCClient extends EventEmitter {
         return Buffer.from(channels.map(channel => `${channel}\0`).join(''), 'utf8');
     }
 
+    private wrapFmlLoginPayload(channel: string, payload: Buffer): Buffer {
+        return Buffer.concat([
+            this.writeString(channel),
+            this.writeVarInt(payload.length),
+            payload
+        ]);
+    }
+
+    private createKnownForgeLoginReply(channel: string, packetID: number, payload: Buffer): Buffer | null {
+        // Zeta sends S2CLoginFlag as discriminator 98 and expects C2SLoginFlag as
+        // discriminator 99. Both packets carry the same public fields, so echoing
+        // the decoded field payload is enough for the server to advance login.
+        if (channel === 'zeta:main' && packetID === 98) {
+            return Buffer.concat([this.writeVarInt(99), payload]);
+        }
+        return null;
+    }
+
     private traceCustomPayload(direction: 'C->S' | 'S->C', state: string | undefined, packet: any, size?: number) {
         const channel = String(packet?.channel ?? 'unknown');
         const data = packet?.data;
@@ -1159,6 +1177,17 @@ export class MCClient extends EventEmitter {
 
         // CORE FIX: Intercept outgoing packets
         const oldWrite = this.client.write;
+        const allowedEmptyLoginPluginResponses = new Set<number>();
+        const sendLoginPluginResponse = (messageId: number, data?: Buffer) => {
+            if (data === undefined || data.length === 0) {
+                allowedEmptyLoginPluginResponses.add(messageId);
+            }
+
+            const params = data === undefined
+                ? { messageId }
+                : { messageId, data };
+            this.client?.write('login_plugin_response', params);
+        };
         this.client.write = (packetName, params) => {
             // 1. Bypass hostname truncation
             if (packetName === 'set_protocol') {
@@ -1171,11 +1200,13 @@ export class MCClient extends EventEmitter {
             // These cause "unexpected index 0" errors because FML3 expects wrapped packets.
             if (packetName === 'login_plugin_response') {
                 if (!params.data || params.data.length === 0) {
-                    // console.log(`[Plugin] Blocking auto-response for ID ${params.messageId}`);
-                    return; // DO NOT SEND
+                    if (allowedEmptyLoginPluginResponses.has(params.messageId)) {
+                        allowedEmptyLoginPluginResponses.delete(params.messageId);
+                    } else {
+                        // console.log(`[Plugin] Blocking auto-response for ID ${params.messageId}`);
+                        return; // DO NOT SEND
+                    }
                 }
-                const dataHex = params.data.toString('hex').slice(0, 32);
-                // console.log(`[Plugin] Sending wrapped response ID ${params.messageId}, length: ${params.data.length}, data: ${dataHex}...`);
             }
 
             const outgoingSize = this.estimatePacketSize(String(packetName), params);
@@ -1312,20 +1343,23 @@ export class MCClient extends EventEmitter {
 
             if (packet.channel === 'fml:login_wrapper' || packet.channel === 'fml:loginwrapper') {
                 const buf = packet.data as Buffer;
-                if (!buf || buf.length === 0) return;
+                if (!buf || buf.length === 0) {
+                    this.log(LogLevel.DEBUG, '[Handshake] Empty FML login wrapper; no response sent');
+                    return;
+                }
 
-                const offset = { val: 0 };
-                const fmlChannel = this.readString(buf, offset);
-                const innerLen = this.readVarInt(buf, offset); // Inner packet length
-                const packetID = this.readVarInt(buf, offset);
+                try {
+                    const offset = { val: 0 };
+                    const fmlChannel = this.readString(buf, offset);
+                    const innerLen = this.readVarInt(buf, offset); // Inner packet length
+                    const packetID = this.readVarInt(buf, offset);
 
-                // console.log(`[Plugin] FML Channel: ${fmlChannel}, PacketID: ${packetID}`);
+                    this.log(LogLevel.DEBUG, `[Handshake] FML wrapper channel=${fmlChannel}, packetID=${packetID}, innerLen=${innerLen}`);
 
-                if (fmlChannel === 'fml:handshake') {
-                    let wrappedPayload: Buffer | null = null;
+                    if (fmlChannel === 'fml:handshake') {
+                        let wrappedPayload: Buffer | null = null;
 
-                    if (packetID === 1) { // S2CModList (FML3/FML2)
-                        try {
+                        if (packetID === 1) { // S2CModList (FML3/FML2)
                             const modCount = this.readVarInt(buf, offset);
                             const mods: string[] = [];
                             for (let i = 0; i < modCount; i++) mods.push(this.readString(buf, offset));
@@ -1358,38 +1392,38 @@ export class MCClient extends EventEmitter {
                                 Buffer.concat(regs.map(r => Buffer.concat([this.writeString(r), this.writeString('')]))) // Version must be empty string
                             ]);
 
-                            wrappedPayload = Buffer.concat([
-                                this.writeString('fml:handshake'),
-                                this.writeVarInt(reply.length),
-                                reply
-                            ]);
-                        } catch (e) {
-                            console.error('[Handshake] Error parsing ModList:', e);
+                            wrappedPayload = this.wrapFmlLoginPayload('fml:handshake', reply);
+                        } else if (packetID === 3 || packetID === 4) {
+                            // RegistryData and ConfigData require a C2S ACK packet.
+                            wrappedPayload = this.wrapFmlLoginPayload('fml:handshake', this.writeVarInt(99));
+                            this.log(LogLevel.DEBUG, `[Handshake] Sending ACK (99) for PacketID: ${packetID}`);
+                        } else if (packetID === 5 || packetID === 6) {
+                            // FML3 ModDataList and ChannelMismatchData are informational here.
+                            this.log(LogLevel.DEBUG, `[Handshake] Ignoring informational FML3 packet ${packetID}; no response sent`);
+                            return;
+                        } else {
+                            this.log(LogLevel.DEBUG, `[Handshake] Unknown FML handshake packet ${packetID}; no response sent`);
+                            return;
+                        }
+
+                        if (wrappedPayload) {
+                            sendLoginPluginResponse(packet.messageId, wrappedPayload);
                         }
                     } else {
-                        // All other FML packets (RegistryData, Config, S2CModData) -> ACK (99)
-                        const ack = this.writeVarInt(99);
-                        wrappedPayload = Buffer.concat([
-                            this.writeString('fml:handshake'),
-                            this.writeVarInt(ack.length),
-                            ack
-                        ]);
-                        this.log(LogLevel.DEBUG, `[Handshake] Sending ACK (99) for PacketID: ${packetID}`);
+                        const replyPayload = this.createKnownForgeLoginReply(fmlChannel, packetID, buf.subarray(offset.val));
+                        if (replyPayload) {
+                            this.log(LogLevel.DEBUG, `[Handshake] Replying to known Forge login channel ${fmlChannel} packetID=${packetID}`);
+                            sendLoginPluginResponse(packet.messageId, this.wrapFmlLoginPayload(fmlChannel, replyPayload));
+                        } else {
+                            this.log(LogLevel.DEBUG, `[Handshake] Unknown FML wrapper channel ${fmlChannel}; no response sent`);
+                        }
                     }
-
-                    if (wrappedPayload) {
-                        this.client?.write('login_plugin_response', {
-                            messageId: packet.messageId,
-                            data: wrappedPayload
-                        });
-                    }
+                } catch (e) {
+                    this.log(LogLevel.WARN, `[Handshake] Failed to parse FML login wrapper: ${(e as Error).message}; no response sent`);
                 }
             } else {
-                // Fallback for other plugin channels (usually just empty response)
-                this.client?.write('login_plugin_response', {
-                    messageId: packet.messageId,
-                    data: Buffer.alloc(0)
-                });
+                // Fallback for other plugin channels: vanilla "not understood" response.
+                sendLoginPluginResponse(packet.messageId);
             }
         });
 
