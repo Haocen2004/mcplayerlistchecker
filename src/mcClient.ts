@@ -120,6 +120,9 @@ export class MCClient extends EventEmitter {
     private tpsCommandPendingUntil = 0;
     private tpsCommandCooldownUntil = 0;
     private tpsCommandSuppressUntil = 0;
+    private recentChatEventKeys: Map<string, number> = new Map();
+    private playReady = false;
+    private deserializerResetPending = false;
     public clientOptions: any = {};
 
     constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang', compressionType: CompressionType = 'zlib') {
@@ -320,6 +323,73 @@ export class MCClient extends EventEmitter {
             const i = idx !== undefined ? parseInt(idx, 10) - 1 : auto++;
             return args[i] ?? '';
         });
+    }
+
+    private cleanMinecraftText(text: any): string {
+        return String(text ?? '').replace(/§[0-9a-fk-or]/gi, '');
+    }
+
+    private extractCleanTextFromComponent(component: any): string {
+        return this.cleanMinecraftText(this.extractTextFromComponent(component));
+    }
+
+    private firstDefined(...values: any[]): any {
+        return values.find(value => value !== undefined && value !== null);
+    }
+
+    private resolvePlayerChatSender(packet: any): string {
+        const senderUuid = this.firstDefined(packet.senderUuid, packet.sender);
+        const senderComponent = this.firstDefined(
+            packet.networkName,
+            packet.senderName,
+            packet.displayName
+        );
+
+        let name = senderComponent !== undefined
+            ? this.extractCleanTextFromComponent(senderComponent)
+            : '';
+
+        if (!name && senderUuid && this.uuidToName.has(senderUuid)) {
+            name = this.uuidToName.get(senderUuid)!;
+        }
+
+        return name || 'Unknown';
+    }
+
+    private resolvePlayerChatMessage(packet: any): string {
+        const unsignedComponent = this.firstDefined(
+            packet.unsignedChatContent,
+            packet.unsignedContent
+        );
+        const unsignedText = unsignedComponent !== undefined
+            ? this.extractCleanTextFromComponent(unsignedComponent)
+            : '';
+        if (unsignedText) return unsignedText;
+
+        const plainText = this.cleanMinecraftText(packet.plainMessage ?? '');
+        if (plainText) return plainText;
+
+        const messageComponent = this.firstDefined(
+            packet.signedChatContent,
+            packet.formattedMessage,
+            packet.message
+        );
+
+        return messageComponent !== undefined
+            ? this.extractCleanTextFromComponent(messageComponent)
+            : '';
+    }
+
+    private shouldEmitChatEvent(sender: string, message: string): boolean {
+        const now = Date.now();
+        for (const [key, timestamp] of this.recentChatEventKeys) {
+            if (now - timestamp > 500) this.recentChatEventKeys.delete(key);
+        }
+
+        const key = `${sender}\n${message}`;
+        if (this.recentChatEventKeys.has(key)) return false;
+        this.recentChatEventKeys.set(key, now);
+        return true;
     }
 
     private readVarInt(buf: Buffer, offset: { val: number }): number {
@@ -1153,26 +1223,6 @@ export class MCClient extends EventEmitter {
             ...this.clientOptions
         };
 
-        // Patch protodef FullPacketParser to skip ALL parse errors (not just PartialReadError).
-        // Without this, non-PartialReadError exceptions (e.g. TypeError from tryCatch returning
-        // undefined) destroy the stream pipeline and kill the socket connection.
-        const { FullPacketParser } = require('protodef');
-        if (!FullPacketParser.prototype.__patchedTransform) {
-            const origTransform = FullPacketParser.prototype._transform;
-            FullPacketParser.prototype._transform = function (chunk: Buffer, enc: string, cb: Function) {
-                origTransform.call(this, chunk, enc, (err?: Error) => {
-                    if (err) {
-                        if (!this.noErrorLogging) {
-                            console.warn('[Packet] Parse error (skipped):', (err as any).message || err);
-                        }
-                        return cb();
-                    }
-                    cb();
-                });
-            };
-            FullPacketParser.prototype.__patchedTransform = true;
-        }
-
         this.client = mc.createClient(options);
 
         // CORE FIX: Intercept outgoing packets
@@ -1215,6 +1265,9 @@ export class MCClient extends EventEmitter {
             } else {
                 this.tracePacket('C->S', String(this.client?.state), String(packetName), outgoingSize);
             }
+            if (packetName === 'chat_command') {
+                this.log(LogLevel.INFO, `[Command Packet] -> /${params?.command ?? ''}`);
+            }
             return oldWrite.call(this.client, packetName, params);
         };
 
@@ -1223,6 +1276,10 @@ export class MCClient extends EventEmitter {
                 this.traceCustomPayload('S->C', String(this.client?.state), data, fullBuffer?.length ?? buffer?.length);
             } else {
                 this.tracePacket('S->C', String(this.client?.state), String(meta.name), fullBuffer?.length ?? buffer?.length);
+            }
+
+            if ((meta.name === 'position' || meta.name === 'tags') && String(this.client?.state) === 'play') {
+                this.markPlayReady();
             }
 
             if (meta.name === 'ping' && String(this.client?.state) === 'configuration') {
@@ -1569,57 +1626,89 @@ export class MCClient extends EventEmitter {
         // Chat parsing for modern versions (Modern and Legacy)
         this.client.on('system_chat', (packet) => {
             try {
-                const text = this.extractTextFromComponent(packet.content).replace(/§[0-9a-fk-or]/g, '');
+                const content = this.firstDefined(packet.content, packet.formattedMessage, packet.message);
+                const text = this.extractCleanTextFromComponent(content);
                 const suppressed = this.tryConsumeTpsCommandResponse(text);
                 if (suppressed) {
                     this.log(LogLevel.DEBUG, `[TPS Fallback] Suppressed system chat response: ${text}`);
                     return;
                 }
                 this.log(LogLevel.INFO, `[Chat] (System) ${text}`);
-                this.emit('chat', { sender: 'System', message: text });
+                if (this.shouldEmitChatEvent('System', text)) {
+                    this.emit('chat', { sender: 'System', message: text });
+                }
             } catch (e) {
                 this.log(LogLevel.DEBUG, `[Chat] system_chat parse error: ${(e as Error).message}`);
             }
         });
 
+        this.client.on('systemChat', (packet: any) => {
+            try {
+                const content = this.firstDefined(packet.formattedMessage, packet.content, packet.message);
+                const text = this.extractCleanTextFromComponent(content);
+                const suppressed = this.tryConsumeTpsCommandResponse(text);
+                if (suppressed) {
+                    this.log(LogLevel.DEBUG, `[TPS Fallback] Suppressed systemChat response: ${text}`);
+                    return;
+                }
+                this.log(LogLevel.INFO, `[Chat] (System) ${text}`);
+                if (this.shouldEmitChatEvent('System', text)) {
+                    this.emit('chat', { sender: 'System', message: text });
+                }
+            } catch (e) {
+                this.log(LogLevel.DEBUG, `[Chat] systemChat parse error: ${(e as Error).message}`);
+            }
+        });
+
         this.client.on('player_chat', (packet) => {
             try {
-                const senderUuid = packet.senderUuid;
-                // 1.21.1 renames `senderName`/`unsignedContent` to `networkName`/`unsignedChatContent`
-                // and ships them as anonymous NBT instead of JSON strings.
-                const senderNameComp = packet.networkName ?? packet.senderName ?? null;
-
-                let name = 'Unknown';
-                if (senderNameComp) {
-                    name = this.extractTextFromComponent(senderNameComp).replace(/§[0-9a-fk-or]/g, '');
+                const name = this.resolvePlayerChatSender(packet);
+                const cleanMsg = this.resolvePlayerChatMessage(packet);
+                const suppressed = this.tryConsumeTpsCommandResponse(cleanMsg);
+                if (suppressed) {
+                    this.log(LogLevel.DEBUG, `[TPS Fallback] Suppressed player chat response: ${cleanMsg}`);
+                    return;
                 }
-                if (!name && senderUuid && this.uuidToName.has(senderUuid)) {
-                    name = this.uuidToName.get(senderUuid)!;
-                }
-                if (!name) name = 'Unknown';
-
-                const unsigned = packet.unsignedChatContent ?? packet.unsignedContent;
-                let message = unsigned !== undefined && unsigned !== null
-                    ? this.extractTextFromComponent(unsigned)
-                    : (packet.plainMessage ?? '');
-                const cleanMsg = String(message).replace(/§[0-9a-fk-or]/g, '');
                 this.log(LogLevel.INFO, `[Chat] <${name}> ${cleanMsg}`);
-                this.emit('chat', { sender: name, message: cleanMsg });
+                if (this.shouldEmitChatEvent(name, cleanMsg)) {
+                    this.emit('chat', { sender: name, message: cleanMsg });
+                }
             } catch (e) {
                 this.log(LogLevel.DEBUG, `[Chat] player_chat parse error: ${(e as Error).message}`);
             }
         });
 
+        this.client.on('playerChat', (packet: any) => {
+            try {
+                const name = this.resolvePlayerChatSender(packet);
+                const cleanMsg = this.resolvePlayerChatMessage(packet);
+                const suppressed = this.tryConsumeTpsCommandResponse(cleanMsg);
+                if (suppressed) {
+                    this.log(LogLevel.DEBUG, `[TPS Fallback] Suppressed playerChat response: ${cleanMsg}`);
+                    return;
+                }
+                this.log(LogLevel.INFO, `[Chat] <${name}> ${cleanMsg}`);
+                if (this.shouldEmitChatEvent(name, cleanMsg)) {
+                    this.emit('chat', { sender: name, message: cleanMsg });
+                }
+            } catch (e) {
+                this.log(LogLevel.DEBUG, `[Chat] playerChat parse error: ${(e as Error).message}`);
+            }
+        });
+
         this.client.on('chat', (packet) => {
             try {
-                const text = this.extractTextFromComponent(packet.message).replace(/§[0-9a-fk-or]/g, '');
+                const content = this.firstDefined(packet.message, packet.formattedMessage, packet.content);
+                const text = this.extractCleanTextFromComponent(content);
                 const suppressed = this.tryConsumeTpsCommandResponse(text);
                 if (suppressed) {
                     this.log(LogLevel.DEBUG, `[TPS Fallback] Suppressed legacy chat response: ${text}`);
                     return;
                 }
                 this.log(LogLevel.INFO, `[Chat] ${text}`);
-                this.emit('chat', { sender: 'System', message: text });
+                if (this.shouldEmitChatEvent('System', text)) {
+                    this.emit('chat', { sender: 'System', message: text });
+                }
             } catch (e) {
                 this.log(LogLevel.DEBUG, `[Chat] legacy chat parse error: ${(e as Error).message}`);
             }
@@ -1635,6 +1724,7 @@ export class MCClient extends EventEmitter {
             // These include PartialReadError and "Deserialization error for play.toClient".
             if (err.partialReadError || (err.field && typeof err.field === 'string' && err.field.includes('toClient'))) {
                 this.log(LogLevel.WARN, `Packet parse error (non-fatal): ${err.message}`);
+                this.recoverDeserializerAfterParseError(err);
                 return;
             }
             console.error('Client Error:', err);
@@ -1653,16 +1743,47 @@ export class MCClient extends EventEmitter {
             this.tpsCommandPendingUntil = 0;
             this.tpsCommandCooldownUntil = 0;
             this.tpsCommandSuppressUntil = 0;
-            this.startTpsFallbackTimer();
             this.emit('connected');
         });
     }
 
+    private recoverDeserializerAfterParseError(err: any) {
+        const client = this.client as any;
+        if (!client || this.deserializerResetPending) return;
+
+        const field = typeof err?.field === 'string' ? err.field : '';
+        if (!field.includes('toClient')) return;
+
+        this.deserializerResetPending = true;
+        setImmediate(() => {
+            this.deserializerResetPending = false;
+            if (this.client !== client || client.ended) return;
+
+            try {
+                const state = client.state;
+                client.state = state;
+                this.log(LogLevel.WARN, `[Packet] Recovered ${state}.toClient parser after deserialization error`);
+            } catch (e) {
+                this.log(LogLevel.WARN, `[Packet] Failed to recover parser: ${(e as Error).message}`);
+            }
+        });
+    }
+
+    private markPlayReady() {
+        if (this.playReady) return;
+        this.playReady = true;
+        this.log(LogLevel.INFO, '[Connection] Play state is ready for commands');
+        this.startTpsFallbackTimer();
+    }
+
     private cleanup() {
         this.players.clear();
+        this.playReady = false;
         this.stopTpsFallbackTimer();
         this.tpsCommandPendingUntil = 0;
+        this.tpsCommandCooldownUntil = 0;
         this.tpsCommandSuppressUntil = 0;
+        this.deserializerResetPending = false;
         this.pendingTpsDimensionResult = null;
         if (this.client) {
             this.client.removeAllListeners();
@@ -1705,13 +1826,22 @@ export class MCClient extends EventEmitter {
             this.log(LogLevel.DEBUG, `[TPS Fallback] No TPS update for ${idleMs === Infinity ? 'ever' : `${Math.round(idleMs / 1000)}s`}, requesting via /${command}`);
             this.sendCommand(command);
             const responseWindow = Number(this.clientOptions?.tpsFallbackResponseWindowMs ?? DEFAULT_TPS_FALLBACK_RESPONSE_WINDOW_MS);
-            this.tpsCommandPendingUntil = now + responseWindow;
-            this.tpsCommandSuppressUntil = this.tpsCommandPendingUntil;
             this.tpsCommandCooldownUntil = now + Math.max(cooldown, responseWindow);
         } catch (e) {
             this.log(LogLevel.WARN, `[TPS Fallback] Failed to send command: ${(e as Error).message}`);
             this.tpsCommandCooldownUntil = now + cooldown;
         }
+    }
+
+    private beginTpsCommandResponseWindow(command: string) {
+        const normalized = command.replace(/^\/+/, '').trim().toLowerCase();
+        if (!/^(?:neo)?forge\s+tps(?:\s|$)/.test(normalized)) return;
+
+        const now = Date.now();
+        const responseWindow = Number(this.clientOptions?.tpsFallbackResponseWindowMs ?? DEFAULT_TPS_FALLBACK_RESPONSE_WINDOW_MS);
+        this.pendingTpsDimensionResult = null;
+        this.tpsCommandPendingUntil = now + responseWindow;
+        this.tpsCommandSuppressUntil = this.tpsCommandPendingUntil;
     }
 
     // Parses TPS / MSPT from chat output of `/neoforge tps` (and the older `/forge tps`).
@@ -1752,10 +1882,23 @@ export class MCClient extends EventEmitter {
             mspt = overallKey[2];
             isOverall = true;
         } else {
-            const dimKey = trimmed.match(/^commands\.(?:neo)?forge\.tps\.dimension\s+\S+\s+([\d.]+)\s+([\d.]+)/i);
-            if (dimKey) {
-                tps = dimKey[1];
-                mspt = dimKey[2];
+            const forgeSummaryAll = trimmed.match(/^commands\.forge\.tps\.summary\.all\s+([\d.]+)\s+([\d.]+)/i);
+            if (forgeSummaryAll) {
+                mspt = forgeSummaryAll[1];
+                tps = forgeSummaryAll[2];
+                isOverall = true;
+            } else {
+                const dimKey = trimmed.match(/^commands\.(?:neo)?forge\.tps\.dimension\s+\S+\s+([\d.]+)\s+([\d.]+)/i);
+                if (dimKey) {
+                    tps = dimKey[1];
+                    mspt = dimKey[2];
+                } else {
+                    const forgeSummaryNamed = trimmed.match(/^commands\.forge\.tps\.summary\.named\s+\S+\s+\S+\s+([\d.]+)\s+([\d.]+)/i);
+                    if (forgeSummaryNamed) {
+                        mspt = forgeSummaryNamed[1];
+                        tps = forgeSummaryNamed[2];
+                    }
+                }
             }
         }
 
@@ -1856,7 +1999,11 @@ export class MCClient extends EventEmitter {
         if (!trimmed) {
             throw new Error('command must be a non-empty string');
         }
+        if (!this.playReady) {
+            throw new Error('bot is not ready to send commands yet');
+        }
         this.sendChat(`/${trimmed}`);
+        this.beginTpsCommandResponseWindow(trimmed);
     }
 
     public getPlayers(): Player[] {
