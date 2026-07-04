@@ -2,6 +2,7 @@
   "name": "mcplayerlistchecker",
   "version": "1.0.0",
   "description": "",
+  "packageManager": "pnpm@10.12.1",
   "main": "index.js",
   "scripts": {
     "dev": "ts-node-dev src/index.ts",
@@ -13,6 +14,11 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "zstd-napi"
+    ]
+  },
   "dependencies": {
     "@types/mongodb": "^4.0.6",
     "express": "^5.2.1",

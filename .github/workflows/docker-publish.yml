@@ -38,7 +38,7 @@ jobs:
 
             - name: Build and push to Docker Hub
               if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
-              uses: docker/build-push-action@v5
+              uses: docker/build-push-action@v6
               with:
                   context: .
                   push: true
@@ -63,7 +63,7 @@ jobs:
 
             - name: Build and push to Tencent Cloud Registry
               if: ${{ env.TENCENTCLOUD_REGISTRY != '' && env.TENCENTCLOUD_NAMESPACE != '' && env.TENCENTCLOUD_USERNAME != '' && env.TENCENTCLOUD_PASSWORD != '' }}
-              uses: docker/build-push-action@v5
+              uses: docker/build-push-action@v6
               with:
                   context: .
                   push: true
