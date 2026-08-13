@@ -72,6 +72,8 @@ async function bootstrap() {
     if (config.minecraftSessionJoinMinIntervalMs !== undefined) mcClient.clientOptions.minecraftSessionJoinMinIntervalMs = config.minecraftSessionJoinMinIntervalMs;
     if (config.minecraftSessionJoinRateLimitBackoffMs !== undefined) mcClient.clientOptions.minecraftSessionJoinRateLimitBackoffMs = config.minecraftSessionJoinRateLimitBackoffMs;
     if (config.neoforgeChannels) mcClient.clientOptions.neoforgeChannels = config.neoforgeChannels;
+    if (config.legacyForgeMods) mcClient.clientOptions.legacyForgeMods = config.legacyForgeMods;
+    if (config.forgeMods) mcClient.clientOptions.forgeMods = config.forgeMods;
     if (config.hideErrors !== undefined) mcClient.clientOptions.hideErrors = config.hideErrors;
     if (config.tpsFallbackEnabled !== undefined) mcClient.clientOptions.tpsFallbackEnabled = config.tpsFallbackEnabled;
     if (config.tpsFallbackIdleMs !== undefined) mcClient.clientOptions.tpsFallbackIdleMs = config.tpsFallbackIdleMs;

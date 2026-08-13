@@ -29,6 +29,10 @@ const NEOFORGE_PROTOCOL_ORDINALS: Record<string, number> = {
     play: 1,
     configuration: 4
 };
+const LEGACY_FORGE_HANDSHAKE_CHANNEL = 'FML|HS';
+const LEGACY_FORGE_CHANNELS = ['FML|HS', 'FML', 'FML|MP', 'FORGE'];
+const LEGACY_FORGE_PROTOCOL_VERSION = 2;
+const LEGACY_FORGE_MAX_PROTOCOL = 340;
 
 interface NeoForgeChannelDeclaration {
     id: string;
@@ -123,6 +127,9 @@ export class MCClient extends EventEmitter {
     private recentChatEventKeys: Map<string, number> = new Map();
     private playReady = false;
     private deserializerResetPending = false;
+    private legacyForgeHandshakeState: 'idle' | 'waiting_server_data' | 'waiting_server_complete' | 'pending_complete' | 'complete' = 'idle';
+    private legacyForgeFmlProtocolVersion = LEGACY_FORGE_PROTOCOL_VERSION;
+    private legacyForgeServerMods: Map<string, string> = new Map();
     public clientOptions: any = {};
 
     constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang', compressionType: CompressionType = 'zlib') {
@@ -1121,13 +1128,22 @@ export class MCClient extends EventEmitter {
                 } else {
                     const res = response as any;
                     const versionName = String(res.version?.name || '');
+                    const legacyModinfo = res.modinfo?.type === 'FML' && Array.isArray(res.modinfo?.modList)
+                        ? res.modinfo
+                        : null;
                     const hasForgeData = !!res.forgeData;
+                    const hasLegacyForgeData = !!legacyModinfo;
                     const isNeoForge = /neoforge/i.test(versionName);
-                    const isForge = !isNeoForge && (!!hasForgeData || /forge/i.test(versionName) || res.isModded === true);
+                    const isForge = !isNeoForge && (hasForgeData || hasLegacyForgeData || /forge/i.test(versionName) || res.isModded === true);
                     const modLoader: ServerStatus['modLoader'] = isNeoForge ? 'neoforge' : (isForge ? 'forge' : (hasForgeData ? 'modded' : 'vanilla'));
 
                     const mods = new Map<string, string>();
-                    if (res.forgeData && res.forgeData.d) {
+                    if (legacyModinfo) {
+                        for (const mod of legacyModinfo.modList) {
+                            if (!mod || typeof mod.modid !== 'string') continue;
+                            mods.set(mod.modid, String(mod.version ?? ''));
+                        }
+                    } else if (res.forgeData && res.forgeData.d) {
                         try {
                             const dataBuf = this.decodeFML3Data(res.forgeData.d);
                             const offset = { val: 0 };
@@ -1172,12 +1188,211 @@ export class MCClient extends EventEmitter {
                         isForge,
                         isNeoForge,
                         modLoader,
-                        fmlVersion: res.forgeData ? 'FML3' : undefined,
+                        fmlVersion: res.forgeData ? 'FML3' : (legacyModinfo ? 'FML' : undefined),
                         mods: Array.from(mods.keys())
                     });
                 }
             });
         });
+    }
+
+    private compareMinecraftVersion(a: string, b: string): number {
+        const parse = (value: string) => value.split('.').map(part => {
+            const numeric = parseInt(part, 10);
+            return Number.isFinite(numeric) ? numeric : 0;
+        });
+        const left = parse(a);
+        const right = parse(b);
+        const length = Math.max(left.length, right.length);
+
+        for (let i = 0; i < length; i++) {
+            const diff = (left[i] ?? 0) - (right[i] ?? 0);
+            if (diff !== 0) return diff;
+        }
+        return 0;
+    }
+
+    private isLegacyForge(resolvedVersion: string, status: ServerStatus, modLoader: string): boolean {
+        if (modLoader !== 'forge') return false;
+
+        const protocol = Number(status.protocol);
+        if (Number.isFinite(protocol) && protocol > 0) {
+            return protocol <= LEGACY_FORGE_MAX_PROTOCOL;
+        }
+
+        return this.compareMinecraftVersion(resolvedVersion, '1.12.2') <= 0;
+    }
+
+    private parseLegacyForgeModList(data: Buffer | undefined): Map<string, string> {
+        const mods = new Map<string, string>();
+        if (!data || data.length < 1) return mods;
+
+        try {
+            const offset = { val: 1 }; // skip discriminator
+            const count = this.readVarInt(data, offset);
+            for (let i = 0; i < count && offset.val < data.length; i++) {
+                const modid = this.readString(data, offset);
+                const version = this.readString(data, offset);
+                mods.set(modid, version);
+            }
+        } catch (e) {
+            this.log(LogLevel.WARN, `[Legacy Forge] Failed to parse mod list: ${(e as Error).message}`);
+        }
+
+        return mods;
+    }
+
+    private getLegacyForgeClientMods(): Array<{ modid: string; version: string }> {
+        const configured = this.clientOptions.legacyForgeMods ?? this.clientOptions.forgeMods;
+        if (Array.isArray(configured) && configured.length > 0) {
+            const parsed: Array<{ modid: string; version: string }> = [];
+            for (const entry of configured) {
+                if (typeof entry === 'string') {
+                    const separator = entry.includes('@') ? '@' : (entry.includes(':') ? ':' : null);
+                    if (separator) {
+                        const [modid, version] = entry.split(separator);
+                        if (modid) parsed.push({ modid, version: version || '' });
+                    } else {
+                        parsed.push({ modid: entry, version: '' });
+                    }
+                } else if (entry && typeof entry.modid === 'string') {
+                    parsed.push({ modid: entry.modid, version: String(entry.version ?? '') });
+                }
+            }
+            if (parsed.length > 0) return parsed;
+        }
+
+        if (this.legacyForgeServerMods.size > 0) {
+            return Array.from(this.legacyForgeServerMods, ([modid, version]) => ({ modid, version }));
+        }
+
+        // Fallback for servers that identify as Forge but don't expose a full mod list in the ping.
+        return [
+            { modid: 'mcp', version: '9.42' },
+            { modid: 'FML', version: '8.0.99.99' },
+            { modid: 'Forge', version: '14.23.5.2860' }
+        ];
+    }
+
+    private createLegacyForgeClientHelloPayload(): Buffer {
+        return Buffer.from([1, this.legacyForgeFmlProtocolVersion]);
+    }
+
+    private createLegacyForgeModListPayload(): Buffer {
+        const mods = this.getLegacyForgeClientMods();
+        const payloads = mods.map(mod => Buffer.concat([
+            this.writeString(mod.modid),
+            this.writeString(mod.version)
+        ]));
+
+        return Buffer.concat([
+            Buffer.from([2]),
+            this.writeVarInt(mods.length),
+            ...payloads
+        ]);
+    }
+
+    private createLegacyForgeAckPayload(phase: number): Buffer {
+        return Buffer.from([0xff, phase]);
+    }
+
+    private handleLegacyForgeHandshake(data: Buffer | undefined) {
+        if (!data || data.length === 0) return;
+
+        const discriminator = data.readInt8(0);
+        const client = this.client;
+        if (!client) return;
+
+        if (discriminator === 0) {
+            if (data.length < 2) {
+                this.log(LogLevel.WARN, '[Legacy Forge] ServerHello is too short');
+                return;
+            }
+
+            this.legacyForgeFmlProtocolVersion = data.readUInt8(1) || LEGACY_FORGE_PROTOCOL_VERSION;
+            this.legacyForgeHandshakeState = 'waiting_server_data';
+
+            client.write('custom_payload', {
+                channel: 'REGISTER',
+                data: this.writeDinnerboneChannels(LEGACY_FORGE_CHANNELS)
+            });
+            client.write('custom_payload', {
+                channel: LEGACY_FORGE_HANDSHAKE_CHANNEL,
+                data: this.createLegacyForgeClientHelloPayload()
+            });
+            client.write('custom_payload', {
+                channel: LEGACY_FORGE_HANDSHAKE_CHANNEL,
+                data: this.createLegacyForgeModListPayload()
+            });
+            this.log(LogLevel.INFO, `[Legacy Forge] Received ServerHello (FML ${this.legacyForgeFmlProtocolVersion}), sent client handshake`);
+            return;
+        }
+
+        if (discriminator === 2) {
+            const mods = this.parseLegacyForgeModList(data);
+            this.legacyForgeServerMods = mods;
+            this.log(LogLevel.INFO, `[Legacy Forge] Server has ${mods.size} mods`);
+
+            if (this.legacyForgeHandshakeState === 'waiting_server_data') {
+                this.legacyForgeHandshakeState = 'waiting_server_complete';
+                client.write('custom_payload', {
+                    channel: LEGACY_FORGE_HANDSHAKE_CHANNEL,
+                    data: this.createLegacyForgeAckPayload(2)
+                });
+                this.log(LogLevel.DEBUG, '[Legacy Forge] Accepted server mod list, waiting for registry data');
+            }
+            return;
+        }
+
+        if (discriminator === 3) {
+            if (data.length < 2) {
+                this.log(LogLevel.WARN, '[Legacy Forge] RegistryData is too short');
+                return;
+            }
+
+            const hasMore = data.readUInt8(1) !== 0;
+            let registryName = '';
+            try {
+                const offset = { val: 2 };
+                registryName = this.readString(data, offset);
+            } catch {
+                // Registry name is only used for logging; the boolean above is the important part.
+            }
+            this.log(LogLevel.DEBUG, `[Legacy Forge] RegistryData ${registryName ? `${registryName} ` : ''}${hasMore ? '(more)' : '(last)'}`);
+
+            if (!hasMore && this.legacyForgeHandshakeState === 'waiting_server_complete') {
+                this.legacyForgeHandshakeState = 'pending_complete';
+                client.write('custom_payload', {
+                    channel: LEGACY_FORGE_HANDSHAKE_CHANNEL,
+                    data: this.createLegacyForgeAckPayload(3)
+                });
+                this.log(LogLevel.DEBUG, '[Legacy Forge] Registry data complete, acknowledging');
+            }
+            return;
+        }
+
+        if (discriminator === -1) {
+            if (this.legacyForgeHandshakeState === 'pending_complete') {
+                this.legacyForgeHandshakeState = 'complete';
+                client.write('custom_payload', {
+                    channel: LEGACY_FORGE_HANDSHAKE_CHANNEL,
+                    data: this.createLegacyForgeAckPayload(4)
+                });
+                this.log(LogLevel.INFO, '[Legacy Forge] Server waiting for client completion, acknowledging');
+            } else if (this.legacyForgeHandshakeState === 'complete') {
+                client.write('custom_payload', {
+                    channel: LEGACY_FORGE_HANDSHAKE_CHANNEL,
+                    data: this.createLegacyForgeAckPayload(5)
+                });
+                this.log(LogLevel.INFO, '[Legacy Forge] Handshake complete');
+            }
+            return;
+        }
+
+        if (discriminator === -2) {
+            this.legacyForgeHandshakeState = 'idle';
+            this.log(LogLevel.WARN, '[Legacy Forge] Server reset handshake');
+        }
     }
 
     public async connect() {
@@ -1202,13 +1417,16 @@ export class MCClient extends EventEmitter {
 
         const resolvedVersion = this.resolveMinecraftVersion(status);
         const modLoader = status.modLoader || (status.isNeoForge ? 'neoforge' : (status.isForge ? 'forge' : 'vanilla'));
+        const legacyForge = this.isLegacyForge(resolvedVersion, status, modLoader);
         console.log(`Connection attempt: ${modLoader} (${resolvedVersion})`);
+        this.legacyForgeHandshakeState = 'idle';
+        this.legacyForgeServerMods = new Map(this.serverModVersions);
         this.loadNeoForgeProbeCache(resolvedVersion, modLoader, status.protocol);
         this.neoForgePlayCacheSaved = false;
         this.configureYggdrasilJoinThrottle(modLoader);
 
-        // FML3 marker for modern Forge. NeoForge 1.21.1 uses configuration custom payload negotiation below.
-        const fmlMarker = '\0FML3\0';
+        // Legacy Forge (1.7-1.12.2) advertises FML; modern Forge uses FML3.
+        const fmlMarker = legacyForge ? '\0FML\0' : '\0FML3\0';
         const serverHost = status.isForge ? `${this.host}${fmlMarker}` : this.host;
 
         const options: any = {
@@ -1315,7 +1533,14 @@ export class MCClient extends EventEmitter {
         this.client.on('custom_payload', (packet) => {
             const client = this.client;
             const channel = packet.channel;
-            if (!client || String(client.state) !== 'configuration') return;
+            if (!client) return;
+
+            if (legacyForge && String(client.state) === 'play' && channel === LEGACY_FORGE_HANDSHAKE_CHANNEL) {
+                this.handleLegacyForgeHandshake(packet.data as Buffer | undefined);
+                return;
+            }
+
+            if (String(client.state) !== 'configuration') return;
 
             if (channel === 'c:version') {
                 client.write('custom_payload', {
@@ -1519,11 +1744,32 @@ export class MCClient extends EventEmitter {
                 const uuid = item.uuid || item.UUID;
                 if (!uuid || uuid === this.botUuid) continue;
 
+                const actionName = typeof action === 'string' ? action.toLowerCase() : '';
+                if (actionName === 'remove_player') {
+                    removePlayerByUuid(uuid, 'PlayerInfo Action: Remove Player');
+                    continue;
+                }
+
                 let actionVal: number;
                 if (typeof action === 'number') {
                     actionVal = action;
                 } else if (typeof action === 'object' && action._value !== undefined) {
                     actionVal = action._value;
+                } else if (actionName) {
+                    switch (actionName) {
+                        case 'add_player':
+                            actionVal = 0x01;
+                            break;
+                        case 'update_latency':
+                            actionVal = 0x10;
+                            break;
+                        case 'update_gamemode':
+                        case 'update_display_name':
+                            actionVal = 0;
+                            break;
+                        default:
+                            actionVal = 0;
+                    }
                 } else {
                     // Fallback for older versions if action is not a number or object with _value
                     actionVal = action.add_player ? 0 : -1;
@@ -1562,12 +1808,6 @@ export class MCClient extends EventEmitter {
                         if (oldLatency !== player.latency) {
                             this.emit('playerUpdate', { ...player });
                         }
-                    }
-                }
-
-                if (typeof action === 'string') {
-                    if (action === "remove_player") {
-                        removePlayerByUuid(uuid, 'PlayerInfo Action: Remove Player');
                     }
                 }
 
@@ -1821,7 +2061,7 @@ export class MCClient extends EventEmitter {
         const idleMs = lastUpdate === 0 ? Number.POSITIVE_INFINITY : now - lastUpdate;
         if (idleMs < idleThreshold) return;
 
-        const command = String(this.clientOptions?.tpsFallbackCommand ?? 'neoforge tps').replace(/^\/+/, '');
+        const command = String(this.clientOptions?.tpsFallbackCommand ?? (this.status.modLoader === 'forge' ? 'forge tps' : 'neoforge tps')).replace(/^\/+/, '');
         try {
             this.log(LogLevel.DEBUG, `[TPS Fallback] No TPS update for ${idleMs === Infinity ? 'ever' : `${Math.round(idleMs / 1000)}s`}, requesting via /${command}`);
             this.sendCommand(command);
@@ -1898,6 +2138,24 @@ export class MCClient extends EventEmitter {
                         mspt = forgeSummaryNamed[1];
                         tps = forgeSummaryNamed[2];
                     }
+                }
+            }
+        }
+
+        // Legacy 1.12.2 `/forge tps` raw translate keys:
+        // commands.forge.tps.summary Overall 14.131 20.000
+        // commands.forge.tps.summary Dim  0 (overworld) 0.126 20.000
+        if (!tps) {
+            const legacyOverall = trimmed.match(/^commands\.forge\.tps\.summary\s+Overall\s+([\d.]+)\s+([\d.]+)/i);
+            if (legacyOverall) {
+                mspt = legacyOverall[1];
+                tps = legacyOverall[2];
+                isOverall = true;
+            } else {
+                const legacyDim = trimmed.match(/^commands\.forge\.tps\.summary\s+Dim\s+\S+\s+\([^)]*\)\s+([\d.]+)\s+([\d.]+)/i);
+                if (legacyDim) {
+                    mspt = legacyDim[1];
+                    tps = legacyDim[2];
                 }
             }
         }
