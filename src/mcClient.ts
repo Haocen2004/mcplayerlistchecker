@@ -1153,13 +1153,26 @@ export class MCClient extends EventEmitter {
         if (status.protocol) {
             // 协议号可能对应多个版本（26.1/26.1.1/26.1.2 同为 775，1.20.1/1.20 同为 763）：
             // 优先选默认版本，其次选正式版（排除 pre/rc/snapshot 这类含字母的条目）。
+            // 只返回 minecraft-data 里真正有协议数据的版本，避免选中 26.2 这类"有版本号但无数据目录"
+            // 的版本，导致 createClient 抛 unsupported protocol version。
             const minecraftData = require('minecraft-data');
             const versions = minecraftData.postNettyVersionsByProtocolVersion?.pc?.[status.protocol] as { minecraftVersion: string }[] | undefined;
             const releases = versions?.filter(v => !/[a-zA-Z]/.test(v.minecraftVersion)) ?? [];
-            const matched = versions?.find(v => v.minecraftVersion === DEFAULT_MC_VERSION)
-                ?? releases[0]
-                ?? versions?.[0];
-            if (matched) return matched.minecraftVersion;
+            const candidates = [
+                versions?.find(v => v.minecraftVersion === DEFAULT_MC_VERSION)?.minecraftVersion,
+                ...releases.map(v => v.minecraftVersion),
+                ...(versions ?? []).map(v => v.minecraftVersion)
+            ].filter((candidate): candidate is string => !!candidate);
+
+            for (const candidate of candidates) {
+                try {
+                    if (minecraftData(candidate)) return candidate;
+                } catch {
+                    // 忽略无法解析的版本名，继续尝试下一个候选
+                }
+            }
+
+            this.log(LogLevel.WARN, `[Version] Protocol ${status.protocol} 对应的版本在本机 minecraft-data 中没有协议数据，回退到 ${DEFAULT_MC_VERSION}`);
         }
 
         return DEFAULT_MC_VERSION;

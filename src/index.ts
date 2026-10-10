@@ -91,7 +91,8 @@ async function bootstrap() {
         });
     }
 
-    mcClient.connect();
+    // connect() 是异步的：把失败显式记录，避免未处理的 Promise rejection 终止进程
+    mcClient.connect().catch((e) => console.error('[Client] Connect failed:', e));
     startApiServer(mcClient, apiPort);
 
     console.log(`\nMC Player List Checker started.`);
