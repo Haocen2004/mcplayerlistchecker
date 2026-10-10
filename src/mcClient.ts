@@ -1637,8 +1637,20 @@ export class MCClient extends EventEmitter {
 
             if (String(client.state) !== 'configuration') return;
 
-            if (channel === 'c:version') {
+            if (channel === 'combat_roll:config_sync') {
+                // Combat Roll（FTB Evolution 2 里的必需 mod）在 configuration 阶段做双向配置握手：
+                // 服务器发 config_sync（JSON 配置），随后等待客户端的 combat_roll:ack —— 它是该阶段
+                // 唯一的 required serverbound 频道，收不到就 30 秒超时断开连接。
+                // 源码（ZsoltMolnarrr/CombatRoll, neoforge/.../NetworkEvents.java）里服务端 handler 为：
+                //   if (payload.code().equals(ConfigurationTask.ID.toString())) finishCurrentTask(...)
+                // 其中 ConfigurationTask.ID = combat_roll:config，因此 ack 的 payload 就是该字符串（writeUtf）。
+                const buf = packet.data as Buffer | undefined;
                 client.write('custom_payload', {
+                    channel: 'combat_roll:ack',
+                    data: this.writeString('combat_roll:config')
+                });
+                this.log(LogLevel.DEBUG, `[CombatRoll] Acknowledged config sync (${buf?.length ?? 0} bytes)`);
+            } else if (channel === 'c:version') {                client.write('custom_payload', {
                     channel: 'c:version',
                     data: this.createNeoForgeCommonVersionPayload()
                 });

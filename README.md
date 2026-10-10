@@ -82,12 +82,15 @@ NeoForge 服务器如果要求额外的 mod payload，本程序会在 `neoforgeP
 
 ### Minecraft 26.1.2（NeoForge 26.1.x）适配说明
 
-26.1 的 NeoForge 协商协议本身没有变化（通道名、payload 字段顺序、`ConnectionProtocol` 序号 `play=1`/`configuration=4` 全部一致），但有三个上游行为必须额外处理，本分支已内置：
+26.1 的 NeoForge 协商协议本身没有变化（通道名、payload 字段顺序、`ConnectionProtocol` 序号 `play=1`/`configuration=4` 全部一致），但有若干上游行为必须额外处理，本分支已内置：
 
 1. **未声明的频道不许下发**：26.1 的 `NetworkRegistry.checkPacket()` 只允许服务端下发「客户端已声明」的频道。NeoForge 会在 configuration 阶段无条件下发 `neoforge:extensible_enum_data`，并在进入世界后立即下发 `neoforge:recipe_content`，因此客户端必须通过 `minecraft:register` 提前声明这两个频道，否则会被 `multiplayer.disconnect.configuration_error` / `multiplayer.disconnect.invalid_player_data` 断开。本程序在 configuration 阶段一开始（早于 `pong`）就声明内建频道集合。
 2. **登录必须带 `playerUUID`**：26.1 的 `login_start` 需要 UUID，而 `minecraft-protocol` 只在 offline/microsoft 认证分支下准备 `client.uuid`（Mojang 账号认证已下线），因此非正版登录统一走 `offline` 分支。
 3. **命令树校验不兼容**：`minecraft-protocol@1.68.0` 的 `declare_commands` 校验（`impossibleCommandTree`）会对 26.1 的命令树误判并主动断线。本程序不使用命令树（只读玩家列表/TPS），已禁用该校验并保留诊断日志。
 4. **玩家名必须 ≤16 字符**：真实服务端的 login 首包（`ServerboundHelloPacket`，在 NeoForge 日志里显示为 `serverbound/minecraft:hello`）用 `readUtf(16)` 读取名字，超长会被服务端判为解码失败（客户端只显示"网络协议错误"）。`minecraft-protocol` 自带的服务端不做这个校验，因此本地自测发现不了；本程序会对超长用户名自动截断并告警。
+5. **known packs 协商**：带 mod 的服务端会在 configuration 阶段下发 `select_known_packs`（实测 415 个 pack），客户端必须回复自己选择的那部分。库的实现固定回空列表，会被判为不兼容并直接关闭连接；本程序改为回显服务端列表。
+6. **mod 的配置阶段双向握手**：整合包 mod 可以在 configuration 阶段要求客户端回应，例如 Combat Roll 发 `combat_roll:config_sync` 后等待 `combat_roll:ack`（payload 为 UTF-8 字符串 `combat_roll:config`），收不到就 **30 秒超时断开**（客户端看不到任何 disconnect 原因，只看到 socketClosed）。本程序已内置该 ack；连接其它整合包若出现"进入世界前静默超时断线"，可按同样方式补上对应 mod 的 ack。
+7. **同账号并发登录**：被踢并提示 `multiplayer.disconnect.duplicate_login` 说明该正版账号已有客户端在线；短时间反复重连还可能触发 `multiplayer.disconnect.unverified_username`，建议用独立账号或先退出游戏客户端。
 
 `neoforgeProbe` 的候选声明、probe 缓存格式与 1.21.x 完全共用；已连接的 1.21.x 服务器缓存不会被 26.1.2 的缓存覆盖（key 不同）。
 
