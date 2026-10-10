@@ -125,6 +125,11 @@ export class MCClient extends EventEmitter {
     private logLevel: LogLevel = LogLevel.INFO;
     private uuidToName: Map<string, string> = new Map();
     private authType: 'microsoft' | 'mojang' = 'mojang';
+    // 正版登录的 cache key 由 minecraft-protocol 传给 prismarine-auth 的 username 决定
+    // （见 src/client/microsoftAuth.js: new PrismarineAuth(options.username, ...)）。
+    // 登录成功后库里会把 client.username 更新为正版 ID，如果下轮重连继续用它，
+    // cache key 就会变化，导致每次都重新要求设备码授权，因此这里固定住初始用户名。
+    private authUsername: string;
     private botUuid: string | null = null;
     private compressionType: CompressionType = 'zlib';
     private serverModVersions: Map<string, string> = new Map();
@@ -156,6 +161,7 @@ export class MCClient extends EventEmitter {
         this.host = host;
         this.port = port;
         this.username = username;
+        this.authUsername = username;
         this.logLevel = logLevel;
         this.authType = authType;
         this.compressionType = compressionType;
@@ -1506,7 +1512,8 @@ export class MCClient extends EventEmitter {
         const options: any = {
             host: this.host,
             port: this.port,
-            username: this.username,
+            // 正版登录固定使用初始用户名作为认证 cache key，避免登录后被改成正版 ID 时缓存失效
+            username: this.authType === 'microsoft' ? this.authUsername : this.username,
             version: resolvedVersion,
             serverHost: this.host, // Use clean host initially
             // Minecraft 26.1 的 login_start 需要 playerUUID，而 minecraft-protocol 只在 offline/microsoft
@@ -1576,6 +1583,12 @@ export class MCClient extends EventEmitter {
             // 校验监听器，而 declare_commands 要到 play 阶段才下发；在这两个时机各检查一次即可（幂等）。
             if (meta.name === 'finish_configuration' || String(this.client?.state) === 'play') {
                 this.disableUpstreamCommandTreeValidation();
+            }
+
+            // known packs 协商发生在 configuration 阶段，库的监听器在 login success 时就注册了；
+            // 这里再兜一次（幂等），覆盖 play→configuration 重进的情况。
+            if (String(this.client?.state) === 'configuration') {
+                this.overrideSelectKnownPacks();
             }
 
             if ((meta.name === 'position' || meta.name === 'tags') && String(this.client?.state) === 'play') {
@@ -2072,6 +2085,7 @@ export class MCClient extends EventEmitter {
             this.tpsCommandCooldownUntil = 0;
             this.tpsCommandSuppressUntil = 0;
             this.disableUpstreamCommandTreeValidation();
+            this.overrideSelectKnownPacks();
             this.emit('connected');
         });
     }
@@ -2097,6 +2111,28 @@ export class MCClient extends EventEmitter {
         client.on('declare_commands', (packet: any) => {
             const nodeCount = Array.isArray(packet?.nodes) ? packet.nodes.length : 0;
             this.log(LogLevel.DEBUG, `[Commands] Received command tree (${nodeCount} nodes, upstream tree validation disabled)`);
+        });
+        client[marker] = true;
+    }
+
+    // Minecraft 1.20.5+ 的 known packs 协商：服务端在 configuration 阶段下发它支持的
+    // datapack/资源包列表（`select_known_packs`），客户端必须回复自己选择的那部分。
+    // minecraft-protocol 的实现（src/client/play.js）固定回一个**空列表**，这对小型服务端没问题，
+    // 但对带大量 mod 的服务端会被判为不兼容：服务端会直接关闭连接（客户端只看到 socketClosed，
+    // 收不到任何 disconnect 原因）。真实整合包客户端会回它认识的那些 pack，这里按同样的思路
+    // 把服务端下发的列表原样回显（等价于"全部接受"）。
+    private overrideSelectKnownPacks() {
+        const client = this.client as any;
+        if (!client) return;
+
+        const marker = '__mcplcKnownPacksWatcher';
+        if (client[marker] && client.listenerCount('select_known_packs') <= 1) return;
+
+        client.removeAllListeners('select_known_packs');
+        client.on('select_known_packs', (packet: any) => {
+            const packs = Array.isArray(packet?.packs) ? packet.packs : [];
+            this.client?.write('select_known_packs', { packs });
+            this.log(LogLevel.DEBUG, `[Config] Selected ${packs.length} known packs from the server list`);
         });
         client[marker] = true;
     }
