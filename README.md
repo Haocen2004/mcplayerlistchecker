@@ -2,8 +2,9 @@
 
 这是一个基于 Node.js 的 Minecraft 服务器监控工具，旨在实时监测服务器在线玩家列表、TPS/MSPT 等状态信息，并通过 API 和 WebSocket 提供数据接口。
 
-特别针对 **Minecraft 1.21.1 NeoForge** 服务器进行了适配，同时兼容：
+特别针对 **Minecraft 26.1.2 NeoForge（NeoForge 26.1.x，协议号 775）** 服务器进行了适配，同时兼容：
 
+*   **1.21.1 / 1.21.9 / 1.21.11 NeoForge**：沿用同一套 `neoforge:register` 协商流程。
 *   **1.12.2 旧版 Forge**：自动识别 FML modinfo，执行 `FML|HS` 旧版握手、mod 列表和 RegistryData 流程。
 *   **现代 Forge**：保留 FML3 握手处理。
 
@@ -18,7 +19,7 @@
     *   提供 WebSocket 接口实时推送玩家变动和状态更新。
     *   支持 WebSocket 双向通信：发送任意消息即可触发立即刷新。
 *   **智能过滤**：自动过滤机器人自身的进退服记录，不做无效统计。
-*   **NeoForge/Forge 支持**：内置 NeoForge 1.21.1 配置阶段网络协商、1.12.2 旧版 Forge `FML|HS` 握手，以及现代 Forge FML3 握手处理。
+*   **NeoForge/Forge 支持**：内置 NeoForge 26.1.2（含 1.21.x）配置阶段网络协商、1.12.2 旧版 Forge `FML|HS` 握手，以及现代 Forge FML3 握手处理。
 
 ## 🛠️ 环境要求
 
@@ -57,7 +58,7 @@
     "username": "PlayerListChecker",  // 默认用户名 (微软登录后会自动更新)
     "logLevel": "info",       // 日志等级: silent, err, warn, info, debug, verbose, trace
     "microsoft": true,        // 是否启用微软正版验证
-    "minecraftVersion": "1.21.1", // 可选：强制指定协议版本
+    "minecraftVersion": "26.1.2", // 可选：强制指定协议版本（默认 26.1.2，协议号 775）
     "modLoader": "neoforge",  // 可选：vanilla, forge, neoforge, modded；1.12.2 请设为 forge
     "legacyForgeMods": [        // 可选：1.12.2 旧版 Forge 客户端上报的 mod 列表，默认优先使用服务器 ping 返回的 modinfo
         { "modid": "forge", "version": "14.23.5.2860" }
@@ -77,7 +78,17 @@
 }
 ```
 
-NeoForge 1.21.1 服务器如果要求额外的 mod payload，本程序会在 `neoforgeProbe` 开启时主动探测缺失频道，并把探测进度缓存到 `.neoforge_probe_cache.json`。缓存 key 使用 `服务器地址:端口_协议版本` 的 hash，支持中途停止后继续探测，也支持多个服务器自动切换，不需要把特定服务器的频道列表硬编码进 `config.json`。关闭 `neoforgeProbe` 只会停止主动学习新频道，已有缓存仍会加载使用。probe 重连会触发正版 session join，默认会对这一步做串行节流，避免快速探测时被 Mojang session server 限流。
+NeoForge 服务器如果要求额外的 mod payload，本程序会在 `neoforgeProbe` 开启时主动探测缺失频道，并把探测进度缓存到 `.neoforge_probe_cache.json`。缓存 key 使用 `服务器地址:端口_协议版本` 的 hash（26.1/26.1.1/26.1.2 共享协议号 775，因此共用同一份缓存），支持中途停止后继续探测，也支持多个服务器自动切换，不需要把特定服务器的频道列表硬编码进 `config.json`。关闭 `neoforgeProbe` 只会停止主动学习新频道，已有缓存仍会加载使用。probe 重连会触发正版 session join，默认会对这一步做串行节流，避免快速探测时被 Mojang session server 限流。
+
+### Minecraft 26.1.2（NeoForge 26.1.x）适配说明
+
+26.1 的 NeoForge 协商协议本身没有变化（通道名、payload 字段顺序、`ConnectionProtocol` 序号 `play=1`/`configuration=4` 全部一致），但有三个上游行为必须额外处理，本分支已内置：
+
+1. **未声明的频道不许下发**：26.1 的 `NetworkRegistry.checkPacket()` 只允许服务端下发「客户端已声明」的频道。NeoForge 会在 configuration 阶段无条件下发 `neoforge:extensible_enum_data`，并在进入世界后立即下发 `neoforge:recipe_content`，因此客户端必须通过 `minecraft:register` 提前声明这两个频道，否则会被 `multiplayer.disconnect.configuration_error` / `multiplayer.disconnect.invalid_player_data` 断开。本程序在 configuration 阶段一开始（早于 `pong`）就声明内建频道集合。
+2. **登录必须带 `playerUUID`**：26.1 的 `login_start` 需要 UUID，而 `minecraft-protocol` 只在 offline/microsoft 认证分支下准备 `client.uuid`（Mojang 账号认证已下线），因此非正版登录统一走 `offline` 分支。
+3. **命令树校验不兼容**：`minecraft-protocol@1.68.0` 的 `declare_commands` 校验（`impossibleCommandTree`）会对 26.1 的命令树误判并主动断线。本程序不使用命令树（只读玩家列表/TPS），已禁用该校验并保留诊断日志。
+
+`neoforgeProbe` 的候选声明、probe 缓存格式与 1.21.x 完全共用；已连接的 1.21.x 服务器缓存不会被 26.1.2 的缓存覆盖（key 不同）。
 
 连接 1.12.2 Forge 服务器时，程序会在登录后通过 `REGISTER` 注册旧版 Forge 频道，并按 `FML|HS` 的 ServerHello → ClientHello/ModList → RegistryData → HandshakeAck 流程完成握手。默认客户端 mod 列表优先从服务器 ping 返回的 `modinfo.modList` 自动生成；如果你的服务器 ping 未返回完整 modinfo，可显式配置 `legacyForgeMods` 或 `forgeMods`。
 
@@ -134,8 +145,17 @@ docker run -d \
 **Q: 连接 1.12.2 Forge 服务器时能登录但玩家列表为空或握手卡住？**
 A: 请确认 `minecraftVersion` 为 `1.12.2`、`modLoader` 为 `forge`。如果服务器没有在 ping 响应中返回 modinfo，可在 `config.json` 中显式配置 `legacyForgeMods`，内容应至少包含服务器要求客户端具备的 Forge/FML 版本。
 
+**Q: 连接 26.1.2 NeoForge 服务器时被踢，提示 `configuration_error` 或 `invalid_player_data`？**
+A: 说明客户端没有按 26.1 的要求声明 `neoforge:extensible_enum_data` / `neoforge:recipe_content`（服务端 `checkPacket` 只允许下发已声明的频道）。本分支已内置声明；如果你修改过 `NEOFORGE_261_REQUIRED_CLIENTBOUND_CHANNELS`，请确认两个频道都在。
+
+**Q: 26.1.2 服务器的 ping 结果里 `playersOnline` 一直是 0？**
+A: `playersOnline` 来自服务器状态响应（`status`），而玩家明细来自游戏内 `player_info`。如果服务器在空闲时会暂停（`Server empty for 60 seconds, pausing`），状态响应可能暂时只反映机器人自己或为空，以 `/players` 返回的 `players` 数组为准。
+
 **Q: 控制台出现 `PartialReadError: Unexpected buffer end` 报错？**
 A: 这是由于 `minecraft-protocol` 库在解析某些新的 1.20.2+、NeoForge 或特定 Forge 数据包时出现的警告。只要显示已登录并且能正常接收玩家信息，通常不影响功能，可以忽略。
+
+**Q: 日志出现 `Received command tree (... nodes, upstream tree validation disabled)`？**
+A: 这是有意为之：26.1 的命令树会让 `minecraft-protocol` 的校验误判并断线，本程序不使用命令树，因此禁用了该校验，这行日志仅用于确认命令树已被解析。
 
 **Q: 无法连接 MongoDB？**
 A: 程序会提示 `Continuing without MongoDB...`。由于项目目前已降级 MongoDB 驱动以兼容旧版本（3.6+），请检查连接地址和数据库状态。

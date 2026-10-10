@@ -15,11 +15,11 @@ importers:
         specifier: ^5.2.1
         version: 5.2.1
       minecraft-data:
-        specifier: 3.111.0
-        version: 3.111.0
+        specifier: 3.117.0
+        version: 3.117.0
       minecraft-protocol:
-        specifier: ^1.54.0
-        version: 1.66.2
+        specifier: ^1.68.0
+        version: 1.68.0
       minecraft-protocol-forge:
         specifier: ^1.0.0
         version: 1.0.0
@@ -708,8 +708,8 @@ packages:
     resolution: {integrity: sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==}
     engines: {node: '>=10'}
 
-  minecraft-data@3.111.0:
-    resolution: {integrity: sha512-0kKHqNZL/D1IbH7tJXBJ3z7YSn1/ylnWWR7X2zFwtEV+yr23nimItpGjP3o8UaLYrC+OV1gKLFQoew03XvJyoA==}
+  minecraft-data@3.117.0:
+    resolution: {integrity: sha512-glKv0EEmVwKvJwdNAKAal2P7gi/nijU9rEMp8gJmqYYRVswS6hA0q9566lcGHH07Ocmpqw5bMRbARC25pR13gA==}
 
   minecraft-folder-path@1.2.0:
     resolution: {integrity: sha512-qaUSbKWoOsH9brn0JQuBhxNAzTDMwrOXorwuRxdJKKKDYvZhtml+6GVCUrY5HRiEsieBEjCUnhVpDuQiKsiFaw==}
@@ -718,8 +718,8 @@ packages:
     resolution: {integrity: sha512-ymTI512qJhW9/wNCAcifC+21AhuomkAF+vXSEnsLEENFNXftZTxwgghO3t6YYFYueFD9ETJ+Lu75Y3u6f5h1BA==}
     engines: {node: '>=4'}
 
-  minecraft-protocol@1.66.2:
-    resolution: {integrity: sha512-keY1IY1E2AeurcekCfcXrg0TDbykGVFiMe1E4wR8QkNtQRieNwfr2xaF3g3vT9ChkwzvENqp3jxgmtFCKSUKPg==}
+  minecraft-protocol@1.68.0:
+    resolution: {integrity: sha512-atAGg/fhIVqyK6voWvED5QA+4ah65PNwpoDnkHawWhVzQbwFii77KcF6OpsU/Xlbi0o9GpihHiPdORSxXEA+Ug==}
     engines: {node: '>=22'}
 
   minimatch@3.1.5:
@@ -1950,7 +1950,7 @@ snapshots:
 
   mimic-response@3.1.0: {}
 
-  minecraft-data@3.111.0: {}
+  minecraft-data@3.117.0: {}
 
   minecraft-folder-path@1.2.0: {}
 
@@ -1958,7 +1958,7 @@ snapshots:
     dependencies:
       protodef: 0.2.5
 
-  minecraft-protocol@1.66.2:
+  minecraft-protocol@1.68.0:
     dependencies:
       '@types/node-rsa': 1.1.4
       '@types/readable-stream': 4.0.24
@@ -1967,7 +1967,7 @@ snapshots:
       debug: 4.4.3
       endian-toggle: 0.0.0
       lodash.merge: 4.6.2
-      minecraft-data: 3.111.0
+      minecraft-data: 3.117.0
       minecraft-folder-path: 1.2.0
       node-fetch: 2.7.0
       node-rsa: 0.4.2

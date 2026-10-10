@@ -45,7 +45,7 @@ async function bootstrap() {
             listenPort: Number(config.serverModePort || config.capturePort || 25566),
             targetHost: host,
             targetPort: port,
-            minecraftVersion: config.minecraftVersion || '1.21.1',
+            minecraftVersion: config.minecraftVersion || '26.1.2',
             cacheFile: config.neoforgeProbeCacheFile,
             captureTimeoutMs: config.serverModeCaptureTimeoutMs
         });

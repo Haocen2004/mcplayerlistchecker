@@ -5,7 +5,11 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import { applyCompression, CompressionType } from './compression';
 
-const DEFAULT_MC_VERSION = '1.21.1';
+// 默认目标版本：Minecraft 26.1.2（NeoForge 26.1.x 是 26.1 的 hotfix，协议号同为 775）。
+// 26.1/26.1.1/26.1.2 共享 minecraft-data 的 26.1 数据目录，因此该默认值可直接被 minecraft-data 解析。
+const DEFAULT_MC_VERSION = '26.1.2';
+// 旧版本（1.12.2 Forge、1.21.1 NeoForge）仍受支持，只是不再作为默认值。
+const LEGACY_SUPPORTED_MC_VERSIONS = ['1.21.1', '1.21.8', '1.21.11', '1.12.2'];
 const DEFAULT_RECONNECT_DELAY_MS = 5000;
 const DEFAULT_NEOFORGE_PROBE_RETRY_DELAY_MS = 1000;
 const DEFAULT_NEOFORGE_PROBE_MAX_CHANNELS = 1024;
@@ -24,6 +28,21 @@ const NEOFORGE_INITIAL_CHANNELS = [
     'neoforge:modded_network_setup_failed',
     'c:version',
     'c:register'
+];
+// NeoForge 26.1 起，服务端会向 NeoForge 客户端无条件下发以下 modded payload，而 NetworkRegistry.checkPacket()
+// 只允许下发「客户端已声明」的频道（BUILTIN 与 minecraft:* 除外）。未声明时服务端会抛
+// UnsupportedOperationException：
+//   - configuration 阶段：neoforge:check_extensible_enum 任务无条件下发 neoforge:extensible_enum_data
+//     （未声明 → multiplayer.disconnect.configuration_error）
+//   - play 阶段：26.1 起配方内容改为通过 modded payload 同步，进入世界后立即下发 neoforge:recipe_content
+//     （未声明 → multiplayer.disconnect.invalid_player_data）
+// 这些都是单向 payload，客户端收到即可，只需对 extensible_enum_data 回一个空的
+// neoforge:extensible_enum_ack（unit codec，无 payload）。
+// 不要声明 neoforge:frozen_registry*（会触发 SyncRegistries 注册表全量同步）、
+// neoforge:feature_flags 与 neoforge:known_registry_data_maps（服务器的任务会自行检查 hasChannel 并跳过）。
+const NEOFORGE_261_REQUIRED_CLIENTBOUND_CHANNELS = [
+    'neoforge:extensible_enum_data',
+    'neoforge:recipe_content'
 ];
 const NEOFORGE_PROTOCOL_ORDINALS: Record<string, number> = {
     play: 1,
@@ -776,6 +795,32 @@ export class MCClient extends EventEmitter {
         return Buffer.concat(parts);
     }
 
+    // configuration 阶段向服务器声明本端监听的 clientbound 通道：
+    // NeoForge 的 BUILTIN_PAYLOADS（协商开始前即可收发的那 7 条）+ NeoForge 26.1 起必须声明的频道
+    // + 探测到的 configuration 阶段 modded 频道。
+    // 服务器用这份声明决定是否注册 CommonVersion/CommonRegister 任务，所以必须尽早（pong 之前）发送。
+    private getNeoForgeConfigurationChannels(): string[] {
+        const configurationChannels = this.getNeoForgeChannelDeclarations()
+            .filter(declaration => declaration.protocols.includes('configuration'))
+            .map(declaration => declaration.id);
+
+        return Array.from(new Set([
+            ...NEOFORGE_INITIAL_CHANNELS,
+            ...NEOFORGE_261_REQUIRED_CLIENTBOUND_CHANNELS,
+            ...configurationChannels
+        ]));
+    }
+
+    private sendNeoForgeConfigurationChannels(client: mc.Client) {
+        const channels = this.getNeoForgeConfigurationChannels();
+
+        client.write('custom_payload', {
+            channel: 'minecraft:register',
+            data: this.writeDinnerboneChannels(channels)
+        });
+        this.log(LogLevel.DEBUG, `[NeoForge] Declared ${channels.length} clientbound channels to the server`);
+    }
+
     private isNeoForgeProbeEnabled(): boolean {
         return this.clientOptions.neoforgeProbe !== false;
     }
@@ -1095,6 +1140,7 @@ export class MCClient extends EventEmitter {
     }
 
     private resolveMinecraftVersion(status: ServerStatus): string {
+        // 服务器 ping 的版本名可能是 "26.1.2"、"NeoForge 26.1.2"、"Paper 1.21.1" 这类形式，先按数字版本号提取。
         const versionFromName = status.version?.match(/\b\d+\.\d+(?:\.\d+)?\b/)?.[0];
         if (versionFromName) {
             try {
@@ -1105,9 +1151,14 @@ export class MCClient extends EventEmitter {
         }
 
         if (status.protocol) {
+            // 协议号可能对应多个版本（26.1/26.1.1/26.1.2 同为 775，1.20.1/1.20 同为 763）：
+            // 优先选默认版本，其次选正式版（排除 pre/rc/snapshot 这类含字母的条目）。
             const minecraftData = require('minecraft-data');
             const versions = minecraftData.postNettyVersionsByProtocolVersion?.pc?.[status.protocol] as { minecraftVersion: string }[] | undefined;
-            const matched = versions?.find(v => v.minecraftVersion === DEFAULT_MC_VERSION) ?? versions?.[0];
+            const releases = versions?.filter(v => !/[a-zA-Z]/.test(v.minecraftVersion)) ?? [];
+            const matched = versions?.find(v => v.minecraftVersion === DEFAULT_MC_VERSION)
+                ?? releases[0]
+                ?? versions?.[0];
             if (matched) return matched.minecraftVersion;
         }
 
@@ -1435,7 +1486,9 @@ export class MCClient extends EventEmitter {
             username: this.username,
             version: resolvedVersion,
             serverHost: this.host, // Use clean host initially
-            auth: this.authType,
+            // Minecraft 26.1 的 login_start 需要 playerUUID，而 minecraft-protocol 只在 offline/microsoft
+            // 认证分支下准备 client.uuid；Mojang 账号认证早已下线，因此非正版登录一律走 offline 分支。
+            auth: this.authType === 'microsoft' ? 'microsoft' : 'offline',
             profilesFolder: './.minecraft_auth', // Enable built-in auth caching
             hideErrors: true, // Suppress packet parsing errors (e.g. declare_commands on modded servers)
             ...this.clientOptions
@@ -1496,6 +1549,12 @@ export class MCClient extends EventEmitter {
                 this.tracePacket('S->C', String(this.client?.state), String(meta.name), fullBuffer?.length ?? buffer?.length);
             }
 
+            // 上游 chat 插件在 finish_configuration（configuration 末尾）时才注册 declare_commands
+            // 校验监听器，而 declare_commands 要到 play 阶段才下发；在这两个时机各检查一次即可（幂等）。
+            if (meta.name === 'finish_configuration' || String(this.client?.state) === 'play') {
+                this.disableUpstreamCommandTreeValidation();
+            }
+
             if ((meta.name === 'position' || meta.name === 'tags') && String(this.client?.state) === 'play') {
                 this.markPlayReady();
             }
@@ -1554,6 +1613,12 @@ export class MCClient extends EventEmitter {
                     data: this.createNeoForgeCommonRegisterPayload()
                 });
                 this.log(LogLevel.DEBUG, '[NeoForge] Replied c:register with no common play channels');
+            } else if (channel === 'minecraft:register') {
+                // 服务器刚声明了自己监听的通道（configuration 阶段开头）。
+                // 真实 NeoForge 客户端会立刻回一份自己的监听列表；服务器的 hasChannel(c:version/c:register)
+                // 是在收到 pong(0) 触发 runConfiguration() 时求值的，所以这里必须抢在 pong 之前发出，
+                // 否则服务器不会注册 CommonVersion/CommonRegister 任务。
+                this.sendNeoForgeConfigurationChannels(client);
             } else if (channel === 'neoforge:register') {
                 const queryPayload = this.createNeoForgeModdedNetworkQueryPayload();
                 client.write('custom_payload', {
@@ -1563,7 +1628,7 @@ export class MCClient extends EventEmitter {
                 this.log(LogLevel.DEBUG, `[NeoForge] Sent ${this.getNeoForgeChannelDeclarations().length} configured modded channel declarations (${queryPayload.length} bytes)`);
             } else if (channel === 'neoforge:network') {
                 const setupChannels = this.collectNeoForgeSetupChannels(packet.data as Buffer | undefined);
-                const registeredChannels = Array.from(new Set([...NEOFORGE_INITIAL_CHANNELS, ...setupChannels]));
+                const registeredChannels = Array.from(new Set([...this.getNeoForgeConfigurationChannels(), ...setupChannels]));
                 client.write('custom_payload', {
                     channel: 'minecraft:register',
                     data: this.writeDinnerboneChannels(registeredChannels)
@@ -1983,8 +2048,34 @@ export class MCClient extends EventEmitter {
             this.tpsCommandPendingUntil = 0;
             this.tpsCommandCooldownUntil = 0;
             this.tpsCommandSuppressUntil = 0;
+            this.disableUpstreamCommandTreeValidation();
             this.emit('connected');
         });
+    }
+
+    // minecraft-protocol 1.68.0 的 client/chat.js 会对 `declare_commands` 做 validateCommandTree 校验，
+    // 该实现不兼容 Minecraft 26.1（协议 775）实际下发的命令树，命中后会立刻
+    // `client.end('impossibleCommandTree')` 并报 "Server sent an impossible command tree"，
+    // 表现为进入世界后立刻断线并反复重连。
+    // 本程序只读玩家列表/TPS、不发送签名聊天，不依赖命令树，因此移除库的校验监听器，
+    // 只保留一条诊断日志。
+    // 时机很讲究：chat 插件是在收到 finish_configuration 包时才注册这些监听器的
+    // （minecraft-protocol/src/client/play.js 的 onLogin → signedChatPlugin），
+    // 且 client 先 emit 具体包名再 emit 'packet'，所以这里要"每次都检查一遍"：
+    // 只要发现除我们自己之外的 declare_commands 监听器（即库又注册了）就再移除一次。
+    private disableUpstreamCommandTreeValidation() {
+        const client = this.client as any;
+        if (!client) return;
+
+        const marker = '__mcplcCommandTreeWatcher';
+        if (client[marker] && client.listenerCount('declare_commands') <= 1) return;
+
+        client.removeAllListeners('declare_commands');
+        client.on('declare_commands', (packet: any) => {
+            const nodeCount = Array.isArray(packet?.nodes) ? packet.nodes.length : 0;
+            this.log(LogLevel.DEBUG, `[Commands] Received command tree (${nodeCount} nodes, upstream tree validation disabled)`);
+        });
+        client[marker] = true;
     }
 
     private recoverDeserializerAfterParseError(err: any) {

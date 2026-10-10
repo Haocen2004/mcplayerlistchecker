@@ -39,6 +39,9 @@ export interface NeoForgeConfigServerOptions {
     captureTimeoutMs?: number;
 }
 
+// NeoForge 协商使用的内建通道（与 src/mcClient.ts 保持同步）。
+// 注意：采集端扮演的是服务器，Minecraft 26.1 新增的 "客户端未声明的频道不许下发" 校验只在
+// 服务器 send 时生效，本端不主动下发 extensible_enum_data / recipe_content，因此这里保持最小集合。
 const NEOFORGE_INITIAL_CHANNELS = [
     'minecraft:register',
     'minecraft:unregister',
@@ -48,6 +51,7 @@ const NEOFORGE_INITIAL_CHANNELS = [
     'c:version',
     'c:register'
 ];
+// ConnectionProtocol 枚举序号在 26.1.2 仍是 HANDSHAKING=0 / PLAY=1 / STATUS=2 / LOGIN=3 / CONFIGURATION=4
 const NEOFORGE_PROTOCOLS_BY_ORDINAL: Record<number, string> = {
     1: 'play',
     4: 'configuration'

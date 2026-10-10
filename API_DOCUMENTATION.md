@@ -19,8 +19,8 @@ Returns the current server status and the list of online players.
 {
   "status": {
     "online": true,
-    "version": "1.21.1",
-    "protocol": 767,
+    "version": "26.1.2",
+    "protocol": 775,
     "motd": "A Minecraft Server",
     "playersOnline": 5,
     "playersMax": 20,
@@ -52,7 +52,7 @@ Returns only the current server status information.
 ```json
 {
   "online": true,
-  "version": "1.21.1",
+  "version": "26.1.2",
   ...
   "tps": "20.0",
   "mspt": "15.5"
