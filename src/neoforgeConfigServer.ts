@@ -37,6 +37,12 @@ export interface NeoForgeConfigServerOptions {
     minecraftVersion: string;
     cacheFile?: string;
     captureTimeoutMs?: number;
+    /**
+     * 采集完成后是否继续 configuration 流程。
+     * 默认 false：本端只是采集用的最小服务端，继续下发 registry_data 等数据会被真实 26.1 客户端
+     * 判为协议错误，而采集此时已完成，保持连接即可。
+     */
+    continueConfigurationAfterCapture?: boolean;
 }
 
 // NeoForge 协商使用的内建通道（与 src/mcClient.ts 保持同步）。
@@ -55,6 +61,10 @@ const NEOFORGE_INITIAL_CHANNELS = [
 const NEOFORGE_PROTOCOLS_BY_ORDINAL: Record<number, string> = {
     1: 'play',
     4: 'configuration'
+};
+const NEOFORGE_PROTOCOL_ORDINALS: Record<string, number> = {
+    play: 1,
+    configuration: 4
 };
 
 function readVarInt(buf: Buffer, offset: { val: number }): number {
@@ -109,6 +119,38 @@ function writeDinnerboneChannels(channels: string[]): Buffer {
 
 function createEmptyNeoForgeModdedNetworkQueryPayload(): Buffer {
     return writeVarInt(0);
+}
+
+// 构造 ModdedNetworkPayload（neoforge:network = NetworkPayloadSetup）的 body。
+// 结构：VarInt 协议组数；每组 VarInt 协议序号、VarInt 频道数；
+//       每频道写 Map key(Identifier) + NetworkChannel.id + NetworkChannel.chosenVersion 三个字符串。
+// 采集端把客户端声明的频道原样回显（等价于"全部接受"），这样真实客户端会认为协商成功，
+// 不会因为自己的必需（required）频道没被协商而主动断开。
+function createNeoForgeModdedNetworkSetupPayload(declarations: NeoForgeChannelDeclaration[]): Buffer {
+    const byProtocol = new Map<number, NeoForgeChannelDeclaration[]>();
+
+    for (const declaration of declarations) {
+        for (const protocol of declaration.protocols) {
+            const ordinal = NEOFORGE_PROTOCOL_ORDINALS[protocol];
+            if (ordinal === undefined) continue;
+            const channels = byProtocol.get(ordinal) ?? [];
+            channels.push(declaration);
+            byProtocol.set(ordinal, channels);
+        }
+    }
+
+    const parts: Buffer[] = [writeVarInt(byProtocol.size)];
+    for (const [protocol, channels] of byProtocol) {
+        parts.push(writeVarInt(protocol));
+        parts.push(writeVarInt(channels.length));
+        for (const channel of channels) {
+            parts.push(writeString(channel.id));
+            parts.push(writeString(channel.id));
+            parts.push(writeString(channel.version));
+        }
+    }
+
+    return Buffer.concat(parts);
 }
 
 function uniqueValues(values: string[]): string[] {
@@ -209,6 +251,13 @@ function saveCapturedDeclarations(options: NeoForgeConfigServerOptions, declarat
     const probeStates: Record<string, NeoForgeProbeState> = {};
     const defaultsByNamespace: Record<string, Omit<NeoForgeChannelDeclaration, 'id'>> = {};
 
+    // 防止用一份更小的声明集合覆盖已有的大采集结果（例如误用未装 mod 的客户端再连一次）
+    const existing = cache.servers[cacheKey];
+    if (existing && Array.isArray(existing.declarations) && existing.declarations.length > declarations.length) {
+        console.warn(`[NeoForge Capture] 缓存中已有 ${existing.declarations.length} 条声明，本次仅收到 ${declarations.length} 条，保留已有数据（如需覆盖请先删除缓存条目）`);
+        return;
+    }
+
     for (const declaration of declarations) {
         probeStates[declaration.id] = {
             candidates: [declaration],
@@ -256,6 +305,7 @@ function startCaptureHandshake(client: any, options: NeoForgeConfigServerOptions
     client.on('custom_payload', (packet: any) => {
         const channel = String(packet.channel || '');
         const data = packet.data as Buffer | undefined;
+        console.log(`[NeoForge Capture] Client payload: ${channel} (${data?.length ?? 0} bytes)`);
         if (channel === 'c:version') {
             console.log('[NeoForge Capture] Client replied c:version');
         } else if (channel === 'c:register') {
@@ -264,12 +314,33 @@ function startCaptureHandshake(client: any, options: NeoForgeConfigServerOptions
             try {
                 const declarations = parseNeoForgeRegisterPayload(data ?? Buffer.alloc(0));
                 saveCapturedDeclarations(options, declarations);
+
+                // 回显协商结果（以下两步与真实 NeoForge 服务器一致），否则客户端侧会认为协商未完成：
+                //   1. neoforge:network —— 把客户端声明的频道全部标记为协商成功
+                //   2. minecraft:register —— 服务器声明自己监听这些频道
+                client.write('custom_payload', {
+                    channel: 'neoforge:network',
+                    data: createNeoForgeModdedNetworkSetupPayload(declarations)
+                });
+                client.write('custom_payload', {
+                    channel: 'minecraft:register',
+                    data: writeDinnerboneChannels(uniqueValues([
+                        ...NEOFORGE_INITIAL_CHANNELS,
+                        ...declarations.map(declaration => declaration.id)
+                    ]))
+                });
+                console.log(`[NeoForge Capture] Echoed negotiation result for ${declarations.length} channels`);
                 complete();
             } catch (e) {
                 console.error(`[NeoForge Capture] Failed to parse neoforge:register: ${(e as Error).message}`);
                 complete();
             }
         }
+    });
+
+    client.on('end', () => {
+        console.log('[NeoForge Capture] Client disconnected');
+        complete();
     });
 
     client.write('custom_payload', {
@@ -291,8 +362,16 @@ function installCaptureBeforeFinish(client: any, options: NeoForgeConfigServerOp
         if (packetName === 'finish_configuration' && !captureStarted) {
             captureStarted = true;
             startCaptureHandshake(client, options, () => {
-                console.log('[NeoForge Capture] Continuing configuration after capture');
-                originalWrite.call(client, packetName, params);
+                if (options.continueConfigurationAfterCapture) {
+                    console.log('[NeoForge Capture] Continuing configuration after capture');
+                    originalWrite.call(client, packetName, params);
+                    return;
+                }
+
+                // 默认不继续 configuration：本端只是采集用的最小服务端，1.68.0 的 minecraft-protocol
+                // 在 26.1 上继续下发 registry_data 等数据时会被真实客户端判为协议错误
+                // （客户端提示 Network Protocol Error），而采集此时已经完成。
+                console.log('[NeoForge Capture] 采集完成，已保留客户端连接。请直接在 Minecraft 中断开连接。');
             });
             return;
         }

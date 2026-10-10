@@ -1493,6 +1493,16 @@ export class MCClient extends EventEmitter {
         const fmlMarker = legacyForge ? '\0FML\0' : '\0FML3\0';
         const serverHost = status.isForge ? `${this.host}${fmlMarker}` : this.host;
 
+        // 真实服务端的 login 首包（ServerboundHelloPacket，NeoForge 日志里显示为
+        // 'serverbound/minecraft:hello'）用 readUtf(16) 读取玩家名：名字超过 16 字符时服务端会直接抛
+        // DecoderException 并断开（客户端只看到 "网络协议错误"）。minecraft-protocol 自带的服务端实现
+        // 不做这个校验，所以本地自测发现不了，这里统一兜底截断。
+        if (this.authType !== 'microsoft' && this.username.length > 16) {
+            const truncated = this.username.slice(0, 16);
+            this.log(LogLevel.WARN, `[Auth] 用户名 "${this.username}" 超过 16 字符上限，登录时将使用 "${truncated}"`);
+            this.username = truncated;
+        }
+
         const options: any = {
             host: this.host,
             port: this.port,

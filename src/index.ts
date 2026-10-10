@@ -47,7 +47,8 @@ async function bootstrap() {
             targetPort: port,
             minecraftVersion: config.minecraftVersion || '26.1.2',
             cacheFile: config.neoforgeProbeCacheFile,
-            captureTimeoutMs: config.serverModeCaptureTimeoutMs
+            captureTimeoutMs: config.serverModeCaptureTimeoutMs,
+            continueConfigurationAfterCapture: config.serverModeContinueAfterCapture === true
         });
         return;
     }
