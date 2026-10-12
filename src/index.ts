@@ -48,7 +48,8 @@ async function bootstrap() {
             minecraftVersion: config.minecraftVersion || '26.1.2',
             cacheFile: config.neoforgeProbeCacheFile,
             captureTimeoutMs: config.serverModeCaptureTimeoutMs,
-            continueConfigurationAfterCapture: config.serverModeContinueAfterCapture === true
+            continueConfigurationAfterCapture: config.serverModeContinueAfterCapture === true,
+            forceOverwrite: config.serverModeCaptureForce === true
         });
         return;
     }

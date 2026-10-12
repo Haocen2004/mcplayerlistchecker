@@ -840,9 +840,16 @@ export class MCClient extends EventEmitter {
 
     private getNeoForgeProbeMaxChannels(): number {
         const configured = Number(this.clientOptions.neoforgeProbeMaxChannels);
-        return Number.isFinite(configured) && configured >= 0
+        const base = Number.isFinite(configured) && configured >= 0
             ? configured
             : DEFAULT_NEOFORGE_PROBE_MAX_CHANNELS;
+
+        // 大型模组包的缓存声明数可能已经超过上限（实测某整合包有 1927 个频道，而默认上限 1024），
+        // 此时任何新频道都会被判定为"达到探测上限"而无法学习。这里按"已加载规模 + 上限"放宽，
+        // 既保留配置项作为"单次新增学习量"的约束，又不会因为缓存本来就大而彻底失去学习能力。
+        return this.neoForgeProbeChannels.size > base
+            ? this.neoForgeProbeChannels.size + base
+            : base;
     }
 
     private getMinecraftSessionJoinMinIntervalMs(): number {
@@ -968,6 +975,25 @@ export class MCClient extends EventEmitter {
             if (semver) versions.push(semver);
         }
 
+        // 同一个 mod 的 payload 版本号通常是统一的（例如 logisticsnetworks 全部从 1 升到 9）。
+        // 模组包更新后，缓存里旧频道的版本会整体过时，因此优先复用同命名空间其它已知频道的版本，
+        // 能显著提高一轮就命中正确版本的几率。
+        const namespaceVersions: string[] = [];
+        for (const declaration of this.neoForgeAcceptedChannels.values()) {
+            if (declaration.id.split(':', 1)[0] === namespace) namespaceVersions.push(declaration.version);
+        }
+        for (const [id, state] of this.neoForgeProbeChannels) {
+            if (id.split(':', 1)[0] !== namespace) continue;
+            const candidate = state.candidates[state.candidateIndex];
+            if (candidate) namespaceVersions.push(candidate.version);
+        }
+        // 出现次数多的版本更可能是该 mod 当前的统一版本，排在前面
+        const frequency = new Map<string, number>();
+        for (const version of namespaceVersions) {
+            frequency.set(version, (frequency.get(version) ?? 0) + 1);
+        }
+        versions.push(...[...frequency.entries()].sort((a, b) => b[1] - a[1]).map(([version]) => version));
+
         versions.push('1');
         return this.uniqueValues(versions);
     }
@@ -988,6 +1014,45 @@ export class MCClient extends EventEmitter {
         return additions.length;
     }
 
+    // 从同命名空间其它已知声明推断该 mod 当前统一的声明风格。
+    // 模组包更新时，一个 mod 的 payload 通常一起改版本号/协议/方向/必需性，
+    // 用众数组合作为首选候选能大幅减少探测轮数（否则会先试缓存里的过期值）。
+    private getNeoForgeNamespaceProfile(namespace: string): NeoForgeChannelDeclaration | undefined {
+        const declarations: NeoForgeChannelDeclaration[] = [];
+        for (const declaration of this.neoForgeAcceptedChannels.values()) {
+            if (declaration.id.split(':', 1)[0] === namespace) declarations.push(declaration);
+        }
+        for (const [id, state] of this.neoForgeProbeChannels) {
+            if (id.split(':', 1)[0] !== namespace) continue;
+            const candidate = state.candidates[state.candidateIndex];
+            if (candidate) declarations.push(candidate);
+        }
+        if (declarations.length === 0) return undefined;
+
+        const tally = <T>(values: T[]): T => {
+            const counts = new Map<string, { value: T; count: number }>();
+            for (const value of values) {
+                const key = JSON.stringify(value);
+                const entry = counts.get(key);
+                if (entry) entry.count++;
+                else counts.set(key, { value, count: 1 });
+            }
+            return [...counts.values()].sort((a, b) => b.count - a.count)[0].value;
+        };
+
+        const protocols = tally(declarations.map(d => d.protocols.join('+')).concat()).split('+');
+        const flow = tally(declarations.map(d => d.flow || 'both'));
+        const optional = tally(declarations.map(d => d.optional === true));
+
+        return {
+            id: '',
+            version: tally(declarations.map(d => d.version)),
+            protocols,
+            flow: flow === 'both' ? undefined : flow,
+            optional
+        };
+    }
+
     private getNeoForgeProbeCandidates(channelId: string, hintedVersion?: string): NeoForgeChannelDeclaration[] {
         const shapes: Array<Omit<NeoForgeChannelDeclaration, 'id' | 'version' | 'optional'>> = [
             { protocols: ['play'], flow: 'serverbound' },
@@ -1003,6 +1068,19 @@ export class MCClient extends EventEmitter {
 
         const candidates: NeoForgeChannelDeclaration[] = [];
         const namespace = channelId.split(':', 1)[0];
+
+        // 首选：该 mod 当前的统一风格（模组包更新后最可能的正确组合）
+        const profile = this.getNeoForgeNamespaceProfile(namespace);
+        if (profile) {
+            candidates.push({
+                id: channelId,
+                version: profile.version,
+                protocols: profile.protocols,
+                flow: profile.flow,
+                optional: profile.optional
+            });
+        }
+
         const namespaceDefault = this.neoForgeProbeDefaultsByNamespace.get(namespace);
         if (namespaceDefault) {
             candidates.push({
@@ -1045,11 +1123,48 @@ export class MCClient extends EventEmitter {
         if (accepted) {
             const namespace = accepted.id.split(':', 1)[0];
             this.markNeoForgeChannelAccepted(accepted);
+            const broadcast = this.broadcastNeoForgeNamespaceProfile(namespace, accepted);
             this.saveNeoForgeProbeCache();
-            this.log(LogLevel.DEBUG, `[NeoForge Probe] ${accepted.id} accepted; ${namespace}:* will try protocols=${accepted.protocols.join('+')}, flow=${accepted.flow || 'both'}, version=${accepted.version} first`);
+            this.log(LogLevel.DEBUG, `[NeoForge Probe] ${accepted.id} accepted; ${namespace}:* will try protocols=${accepted.protocols.join('+')}, flow=${accepted.flow || 'both'}, version=${accepted.version} first`
+                + (broadcast > 0 ? ` (已同步到同命名空间另外 ${broadcast} 个频道)` : ''));
         }
 
         this.lastNeoForgeFailureChannel = failedChannelId;
+    }
+
+    // 某个频道被接受后，把它的版本/协议/方向/必需性推到同命名空间其它频道的候选首位。
+    // 模组包更新时一个 mod 的 payload 往往整体变更，这样下一个失败频道可以直接命中正确组合，
+    // 避免"每个频道各试十几轮"。
+    private broadcastNeoForgeNamespaceProfile(namespace: string, accepted: NeoForgeChannelDeclaration): number {
+        let updated = 0;
+
+        for (const [id, state] of this.neoForgeProbeChannels) {
+            if (id === accepted.id) continue;
+            if (id.split(':', 1)[0] !== namespace) continue;
+
+            const next: NeoForgeChannelDeclaration = {
+                id,
+                version: accepted.version,
+                protocols: accepted.protocols,
+                flow: accepted.flow,
+                optional: accepted.optional
+            };
+            const nextKey = this.getNeoForgeProbeCandidateKey(next);
+            const current = state.candidates[state.candidateIndex];
+            if (current && this.getNeoForgeProbeCandidateKey(current) === nextKey) continue;
+
+            const existingIndex = state.candidates.findIndex(candidate => this.getNeoForgeProbeCandidateKey(candidate) === nextKey);
+            if (existingIndex > 0) {
+                const [moved] = state.candidates.splice(existingIndex, 1);
+                state.candidates.unshift(moved);
+            } else if (existingIndex === -1) {
+                state.candidates.unshift(next);
+            }
+            state.candidateIndex = 0;
+            updated++;
+        }
+
+        return updated;
     }
 
     private handleNeoForgeProbeFailure(channelId: string, hintedVersion?: string): boolean {
@@ -1065,6 +1180,9 @@ export class MCClient extends EventEmitter {
 
             if (existing.candidateIndex + 1 >= existing.candidates.length) {
                 this.log(LogLevel.ERR, `[NeoForge Probe] Exhausted candidates for ${channelId}`);
+                this.log(LogLevel.WARN, '[NeoForge Probe] 如果服务端模组包刚更新过，缓存里的频道声明可能已过期：'
+                    + '建议用真实客户端跑一次采集模式（config.json 设 "mode": "server"，客户端连上来一次）来刷新声明，'
+                    + '或删除该服务器的缓存条目后重新探测。');
                 return false;
             }
 

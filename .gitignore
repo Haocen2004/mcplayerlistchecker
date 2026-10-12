@@ -13,6 +13,7 @@ build/
 
 # Configuration and secrets
 config.json
+config.docker.json
 auth_cache.enc
 .minecraft_auth/
 .env

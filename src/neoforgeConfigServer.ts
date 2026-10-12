@@ -43,6 +43,11 @@ export interface NeoForgeConfigServerOptions {
      * 判为协议错误，而采集此时已完成，保持连接即可。
      */
     continueConfigurationAfterCapture?: boolean;
+    /**
+     * 无条件用本次采集结果覆盖已有缓存（默认 false）。
+     * 默认情况下，若本次收到的声明不到已有的一半（且已有超过 100 条），会判定为异常采集并保留旧数据。
+     */
+    forceOverwrite?: boolean;
 }
 
 // NeoForge 协商使用的内建通道（与 src/mcClient.ts 保持同步）。
@@ -251,10 +256,15 @@ function saveCapturedDeclarations(options: NeoForgeConfigServerOptions, declarat
     const probeStates: Record<string, NeoForgeProbeState> = {};
     const defaultsByNamespace: Record<string, Omit<NeoForgeChannelDeclaration, 'id'>> = {};
 
-    // 防止用一份更小的声明集合覆盖已有的大采集结果（例如误用未装 mod 的客户端再连一次）
+    // 防止用一份明显不完整的声明覆盖已有的大采集结果（例如误用未装 mod 的客户端再连一次）。
+    // 注意模组包更新后声明数量可能略有增减，所以只在"新声明不到旧的一半"时才判定为误覆盖；
+    // 需要无条件覆盖时把 serverModeCaptureForce 设为 true。
     const existing = cache.servers[cacheKey];
-    if (existing && Array.isArray(existing.declarations) && existing.declarations.length > declarations.length) {
-        console.warn(`[NeoForge Capture] 缓存中已有 ${existing.declarations.length} 条声明，本次仅收到 ${declarations.length} 条，保留已有数据（如需覆盖请先删除缓存条目）`);
+    const existingCount = Array.isArray(existing?.declarations) ? existing.declarations.length : 0;
+    const looksLikeRegression = existingCount > 100 && declarations.length * 2 < existingCount;
+    if (!options.forceOverwrite && looksLikeRegression) {
+        console.warn(`[NeoForge Capture] 缓存中已有 ${existingCount} 条声明，本次仅收到 ${declarations.length} 条，判定为异常采集并保留已有数据`
+            + '（确需覆盖请设置 serverModeCaptureForce: true）');
         return;
     }
 

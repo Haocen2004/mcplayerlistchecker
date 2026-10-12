@@ -1,0 +1,20 @@
+# mcplayerlistchecker —— Minecraft 26.1.2 / NeoForge 26.1.x 监控容器
+# 用法：
+#   1) 在同目录准备 config.json（见 config.docker.json 示例，指向你的服务器）
+#   2) 确保存在持久化目录/文件：.minecraft_auth/（正版凭据）与 .neoforge_probe_cache.json（NeoForge 频道声明缓存）
+#   3) docker compose up -d
+#   4) curl http://localhost:3010/players   # 应返回 tps / mspt
+services:
+    mc-checker:
+        image: haocen2004/mc-checker:support-26.1.2-neoforge
+        container_name: mc-checker-2612
+        restart: unless-stopped
+        ports:
+            - "3010:3000"
+        volumes:
+            - ./config.docker.json:/app/config.json:ro
+            - ./.minecraft_auth:/app/.minecraft_auth
+            - ./.neoforge_probe_cache.json:/app/.neoforge_probe_cache.json
+        # 需要 MongoDB 记录玩家进出/TPS 历史时，取消下面注释（config.json 里 mongoUri 用 host.docker.internal）
+        # extra_hosts:
+        #     - "host.docker.internal:host-gateway"
