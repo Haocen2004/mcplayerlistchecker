@@ -19,6 +19,41 @@ const DEFAULT_TPS_FALLBACK_IDLE_MS = 30_000;
 const DEFAULT_TPS_FALLBACK_CHECK_INTERVAL_MS = 10_000;
 const DEFAULT_TPS_FALLBACK_RESPONSE_WINDOW_MS = 5_000;
 const DEFAULT_TPS_FALLBACK_MIN_COOLDOWN_MS = 60_000;
+// minecraft-protocol 的 keepalive 插件默认 30 秒收不到 keep_alive 就主动 end('keepAliveError')。
+// 该计时器只由 keep_alive 包刷新（不像原版客户端看任意数据包），网络抖动/丢包重传时容易误断，
+// 所以默认放宽到 60 秒，并允许通过 checkTimeoutInterval 配置。
+const DEFAULT_KEEPALIVE_TIMEOUT_MS = 60_000;
+// 每个收到的包都打 DEBUG 日志在大型模组服上本身就会拖慢事件循环，这里按秒限流。
+const DEFAULT_PACKET_LOG_PER_SECOND = 50;
+const DEFAULT_STATS_INTERVAL_MS = 30_000;
+const PACKET_DATA_LOG_MAX_BYTES = 4_096;
+// play 状态下高频且无信息量的包，不打逐包日志
+const QUIET_PACKET_NAMES = new Set([
+    'keep_alive',
+    'update_time',
+    'rel_entity_move',
+    'entity_metadata',
+    'map_chunk',
+    'custom_payload',
+    'world_event',
+    'sound_effect',
+    'entity_teleport',
+    'entity_velocity',
+    'bundle_delimiter',
+    'update_light',
+    'entity_move_look',
+    'entity_head_rotation',
+    'sync_entity_position',
+    'entity_look',
+    'set_ticking_state',
+    'step_tick',
+    'position',
+    'spawn_entity',
+    'entity_update_attributes',
+    'block_change',
+    'chunk_batch_start',
+    'chunk_batch_finished'
+]);
 const NEOFORGE_COMMON_NETWORK_VERSION = 1;
 const NEOFORGE_INITIAL_CHANNELS = [
     'minecraft:register',
@@ -132,6 +167,16 @@ export class MCClient extends EventEmitter {
     private authUsername: string;
     private botUuid: string | null = null;
     private compressionType: CompressionType = 'zlib';
+    // 连接健康度统计（用于诊断"网络差就断线"这类问题：区分真断网与客户端自身阻塞）
+    private lastPacketReceivedAt = 0;
+    private receivedPacketCount = 0;
+    private sentPacketCount = 0;
+    private packetLogWindowStartedAt = 0;
+    private packetLogWindowCount = 0;
+    private suppressedPacketLogs = 0;
+    private eventLoopLagPeakMs = 0;
+    private eventLoopTimer: NodeJS.Timeout | null = null;
+    private statsTimer: NodeJS.Timeout | null = null;
     private serverModVersions: Map<string, string> = new Map();
     private neoForgeProbeChannels: Map<string, NeoForgeProbeState> = new Map();
     private neoForgeAcceptedChannels: Map<string, NeoForgeChannelDeclaration> = new Map();
@@ -1637,12 +1682,27 @@ export class MCClient extends EventEmitter {
             // Minecraft 26.1 的 login_start 需要 playerUUID，而 minecraft-protocol 只在 offline/microsoft
             // 认证分支下准备 client.uuid；Mojang 账号认证早已下线，因此非正版登录一律走 offline 分支。
             auth: this.authType === 'microsoft' ? 'microsoft' : 'offline',
+            // 库的 keepalive 插件只用 keep_alive 包刷新这个超时（原版客户端看任意数据包），
+            // 默认 30 秒在网络抖动时容易误判，这里放宽到 60 秒并允许配置。
+            checkTimeoutInterval: this.getKeepAliveTimeoutMs(),
             profilesFolder: './.minecraft_auth', // Enable built-in auth caching
             hideErrors: true, // Suppress packet parsing errors (e.g. declare_commands on modded servers)
             ...this.clientOptions
         };
 
         this.client = mc.createClient(options);
+
+        // TCP 层加固：启用 SO_KEEPALIVE 让中间设备/系统尽早发现死连接，setNoDelay 减少小包延迟
+        // （原版客户端由 Netty 默认启用，这里补齐，避免网络质量差时表现不如真实客户端）。
+        try {
+            const socket = (this.client as any)?.socket;
+            if (socket?.setKeepAlive) socket.setKeepAlive(true, 15_000);
+            if (socket?.setNoDelay) socket.setNoDelay(true);
+        } catch (e) {
+            this.log(LogLevel.DEBUG, `[Connection] socket 参数设置失败：${(e as Error).message}`);
+        }
+
+        this.startConnectionDiagnostics();
 
         // CORE FIX: Intercept outgoing packets
         const oldWrite = this.client.write;
@@ -1678,11 +1738,15 @@ export class MCClient extends EventEmitter {
                 }
             }
 
-            const outgoingSize = this.estimatePacketSize(String(packetName), params);
-            if (packetName === 'custom_payload') {
-                this.traceCustomPayload('C->S', String(this.client?.state), params, outgoingSize);
-            } else {
-                this.tracePacket('C->S', String(this.client?.state), String(packetName), outgoingSize);
+            this.sentPacketCount++;
+            // 仅在 TRACE 级别才需要包大小（estimatePacketSize 会完整序列化一遍，属于昂贵操作）
+            if (this.logLevel >= LogLevel.TRACE) {
+                const outgoingSize = this.estimatePacketSize(String(packetName), params);
+                if (packetName === 'custom_payload') {
+                    this.traceCustomPayload('C->S', String(this.client?.state), params, outgoingSize);
+                } else {
+                    this.tracePacket('C->S', String(this.client?.state), String(packetName), outgoingSize);
+                }
             }
             if (packetName === 'chat_command') {
                 this.log(LogLevel.INFO, `[Command Packet] -> /${params?.command ?? ''}`);
@@ -1691,10 +1755,15 @@ export class MCClient extends EventEmitter {
         };
 
         this.client.on('packet', (data, meta, buffer?: Buffer, fullBuffer?: Buffer) => {
-            if (meta.name === 'custom_payload') {
-                this.traceCustomPayload('S->C', String(this.client?.state), data, fullBuffer?.length ?? buffer?.length);
-            } else {
-                this.tracePacket('S->C', String(this.client?.state), String(meta.name), fullBuffer?.length ?? buffer?.length);
+            this.receivedPacketCount++;
+            this.lastPacketReceivedAt = Date.now();
+
+            if (this.logLevel >= LogLevel.TRACE) {
+                if (meta.name === 'custom_payload') {
+                    this.traceCustomPayload('S->C', String(this.client?.state), data, fullBuffer?.length ?? buffer?.length);
+                } else {
+                    this.tracePacket('S->C', String(this.client?.state), String(meta.name), fullBuffer?.length ?? buffer?.length);
+                }
             }
 
             // 上游 chat 插件在 finish_configuration（configuration 末尾）时才注册 declare_commands
@@ -1728,17 +1797,39 @@ export class MCClient extends EventEmitter {
             if (meta.name === 'disconnect' || meta.name === 'kick_disconnect') {
                 this.log(LogLevel.ERR, `Disconnected: ${JSON.stringify(data)}`);
             }
-            // Safe debug logging for play state to catch player disconnects
-            const noise = ['keep_alive', 'update_time', 'rel_entity_move', 'entity_metadata', 'map_chunk', 'custom_payload', 'world_event', 'sound_effect', 'entity_teleport', 'entity_velocity'];
-            if (this.client?.state === 'play' && !noise.includes(meta.name)) {
-                if (this.logLevel < LogLevel.TRACE) {
-                    this.log(LogLevel.DEBUG, `Packet: ${meta.name}`);
-                    try {
-                        const dataStr = data ? JSON.stringify(data).slice(0, 150) : 'undefined';
-                        this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): ${dataStr}`);
-                    } catch (e) {
-                        this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): [JSON Error]`);
+            // play 状态下逐包日志：DEBUG 只打印包名（按秒限流），VERBOSE 才附带数据摘要，
+            // 且只在数据包足够小的时候才做 JSON.stringify —— 大整合包每个包都序列化会阻塞事件循环，
+            // 进而导致 keep_alive 处理延迟、被库判定超时而断线（表现为"网络差就掉线"）。
+            if (this.logLevel >= LogLevel.DEBUG && !QUIET_PACKET_NAMES.has(meta.name)) {
+                const now = Date.now();
+                if (now - this.packetLogWindowStartedAt >= 1000) {
+                    if (this.suppressedPacketLogs > 0) {
+                        this.log(LogLevel.DEBUG, `[Packet] 上一条统计间隔内另有 ${this.suppressedPacketLogs} 条包日志被限流省略`);
+                        this.suppressedPacketLogs = 0;
                     }
+                    this.packetLogWindowStartedAt = now;
+                    this.packetLogWindowCount = 0;
+                }
+
+                if (this.packetLogWindowCount < DEFAULT_PACKET_LOG_PER_SECOND) {
+                    this.packetLogWindowCount++;
+                    this.log(LogLevel.DEBUG, `Packet: ${meta.name}`);
+
+                    if (this.logLevel >= LogLevel.VERBOSE) {
+                        const packetSize = fullBuffer?.length ?? buffer?.length ?? 0;
+                        if (packetSize <= PACKET_DATA_LOG_MAX_BYTES) {
+                            try {
+                                const dataStr = data ? JSON.stringify(data).slice(0, 150) : 'undefined';
+                                this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): ${dataStr}`);
+                            } catch (e) {
+                                this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): [JSON Error]`);
+                            }
+                        } else {
+                            this.log(LogLevel.VERBOSE, `Packet Data (${meta.name}): [${packetSize} bytes, 已跳过序列化]`);
+                        }
+                    }
+                } else {
+                    this.suppressedPacketLogs++;
                 }
             }
         });
@@ -2186,7 +2277,19 @@ export class MCClient extends EventEmitter {
         });
 
         this.client.on('end', (reason) => {
-            this.log(LogLevel.INFO, `Disconnected: ${reason}`);
+            const lastPacketAgo = this.lastPacketReceivedAt ? Date.now() - this.lastPacketReceivedAt : -1;
+            const detail = lastPacketAgo >= 0
+                ? `最后收包 ${lastPacketAgo}ms 前；本连接收包 ${this.receivedPacketCount} / 发包 ${this.sentPacketCount}；事件循环延迟峰值 ${this.eventLoopLagPeakMs}ms`
+                : '本连接未收到任何数据包';
+            this.log(LogLevel.INFO, `Disconnected: ${reason}（${detail}）`);
+
+            if (/keepAlive|timed out/i.test(String(reason))) {
+                this.log(LogLevel.WARN, `[Connection] 判定为心跳超时：${this.getKeepAliveTimeoutMs()}ms 内未收到 keep_alive 包。`
+                    + '该计时器仅由 keep_alive 包刷新（原版客户端看任意数据包，容忍度更高），'
+                    + '网络抖动明显时可调大 config.json 的 checkTimeoutInterval。');
+            }
+
+            this.stopConnectionDiagnostics();
             this.scheduleReconnect(DEFAULT_RECONNECT_DELAY_MS);
         });
 
@@ -2300,6 +2403,7 @@ export class MCClient extends EventEmitter {
         this.players.clear();
         this.playReady = false;
         this.stopTpsFallbackTimer();
+        this.stopConnectionDiagnostics();
         this.tpsCommandPendingUntil = 0;
         this.tpsCommandCooldownUntil = 0;
         this.tpsCommandSuppressUntil = 0;
@@ -2308,6 +2412,55 @@ export class MCClient extends EventEmitter {
         if (this.client) {
             this.client.removeAllListeners();
             this.client = null;
+        }
+    }
+
+    private getKeepAliveTimeoutMs(): number {
+        const configured = Number(this.clientOptions?.checkTimeoutInterval);
+        return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_KEEPALIVE_TIMEOUT_MS;
+    }
+
+    // 连接健康度统计：便于区分"真·网络断开"与"客户端自身阻塞导致的心跳超时"。
+    // eventLoopLagPeakMs 高说明事件循环被卡住（例如日志/序列化过重），不是网络问题。
+    private startConnectionDiagnostics() {
+        this.stopConnectionDiagnostics();
+        this.lastPacketReceivedAt = 0;
+        this.receivedPacketCount = 0;
+        this.sentPacketCount = 0;
+        this.eventLoopLagPeakMs = 0;
+        this.packetLogWindowStartedAt = Date.now();
+        this.packetLogWindowCount = 0;
+        this.suppressedPacketLogs = 0;
+
+        let expected = Date.now() + 200;
+        const lagTimer = setInterval(() => {
+            const now = Date.now();
+            const lag = Math.max(0, now - expected);
+            if (lag > this.eventLoopLagPeakMs) this.eventLoopLagPeakMs = lag;
+            expected = now + 200;
+        }, 200);
+        lagTimer.unref?.();
+        this.eventLoopTimer = lagTimer;
+
+        const statsTimer = setInterval(() => {
+            const lastPacketAgo = this.lastPacketReceivedAt ? Date.now() - this.lastPacketReceivedAt : -1;
+            this.log(LogLevel.DEBUG, `[Connection] 收包 ${this.receivedPacketCount} / 发包 ${this.sentPacketCount}`
+                + `，事件循环延迟峰值 ${this.eventLoopLagPeakMs}ms`
+                + `，距上次收包 ${lastPacketAgo < 0 ? 'n/a' : `${lastPacketAgo}ms`}`);
+            this.eventLoopLagPeakMs = 0;
+        }, DEFAULT_STATS_INTERVAL_MS);
+        statsTimer.unref?.();
+        this.statsTimer = statsTimer;
+    }
+
+    private stopConnectionDiagnostics() {
+        if (this.eventLoopTimer) {
+            clearInterval(this.eventLoopTimer);
+            this.eventLoopTimer = null;
+        }
+        if (this.statsTimer) {
+            clearInterval(this.statsTimer);
+            this.statsTimer = null;
         }
     }
 
