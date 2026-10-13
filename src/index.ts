@@ -6,6 +6,42 @@ import { CompressionType } from './compression';
 import { startApiServer } from './api';
 import { startNeoForgeConfigServer } from './neoforgeConfigServer';
 
+const DEFAULT_LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
+
+// 把 stdout/stderr 同时写入文件（默认关闭）。
+// 容器里 `docker logs` 依赖 log driver，容器重建后历史日志就没了；
+// 开启 logFile 后可以把日志挂载到宿主机持久保存，便于排查断线重连这类需要长期观察的问题。
+function setupLogFile(logFile: string, maxBytes: number) {
+    const resolved = path.resolve(logFile);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+
+    // 简单的单份轮转：超过上限就把当前文件改名成 .1
+    try {
+        if (fs.existsSync(resolved) && fs.statSync(resolved).size >= maxBytes) {
+            fs.renameSync(resolved, `${resolved}.1`);
+        }
+    } catch (e) {
+        console.error(`[Log] 日志轮转失败：${(e as Error).message}`);
+    }
+
+    const stream = fs.createWriteStream(resolved, { flags: 'a' });
+    const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+    const originalStderrWrite = process.stderr.write.bind(process.stderr);
+
+    const tee = (original: typeof process.stdout.write) => (chunk: any, encoding?: any, callback?: any) => {
+        try {
+            stream.write(chunk);
+        } catch {
+            // 写文件失败不应影响正常输出
+        }
+        return original(chunk, encoding, callback);
+    };
+
+    process.stdout.write = tee(originalStdoutWrite) as any;
+    process.stderr.write = tee(originalStderrWrite) as any;
+    console.log(`[Log] 日志同时写入 ${resolved}（单文件上限 ${Math.round(maxBytes / 1024 / 1024)}MB）`);
+}
+
 async function bootstrap() {
     // 1. Determine config path
     let configPath = path.join(process.cwd(), 'config.json');
@@ -26,6 +62,11 @@ async function bootstrap() {
     }
 
     // 3. Merge with CLI Args
+    if (config.logFile) {
+        const maxBytes = Number(config.logFileMaxBytes);
+        setupLogFile(String(config.logFile), Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_LOG_FILE_MAX_BYTES);
+    }
+
     const host = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : (config.host || 'localhost');
     const port = (process.argv[3] && !isNaN(parseInt(process.argv[3]))) ? parseInt(process.argv[3]) : (config.port || 25565);
     const username = process.argv[4] && !process.argv[4].startsWith('--') ? process.argv[4] : (config.username || 'PlayerListBot');

@@ -4,6 +4,11 @@
 #   2) 确保存在持久化目录/文件：.minecraft_auth/（正版凭据）与 .neoforge_probe_cache.json（NeoForge 频道声明缓存）
 #   3) docker compose up -d
 #   4) curl http://localhost:3010/players   # 应返回 tps / mspt
+#
+# 查看日志（排查断线重连）：
+#   docker compose logs -f --tail 200                       # 实时跟随
+#   docker compose logs -t --since 30m | grep -E 'Disconnected|Connection|keepAlive'
+#   tail -f logs/mc-checker.log                             # 若 config 里配了 logFile，可直接看宿主机文件
 services:
     mc-checker:
         image: haocen2004/mc-checker:support-26.1.2-neoforge
@@ -15,6 +20,15 @@ services:
             - ./config.docker.json:/app/config.json:ro
             - ./.minecraft_auth:/app/.minecraft_auth
             - ./.neoforge_probe_cache.json:/app/.neoforge_probe_cache.json
+            # 日志目录：config.json 里设置 "logFile": "/app/logs/mc-checker.log" 后，
+            # 日志会长期保留在宿主机 ./logs/ 下（容器重建也不丢）
+            - ./logs:/app/logs
+        # 限制 docker 自身日志体积（默认 json-file 无上限，长期运行会占满磁盘）
+        logging:
+            driver: json-file
+            options:
+                max-size: "10m"
+                max-file: "3"
         # 需要 MongoDB 记录玩家进出/TPS 历史时，取消下面注释（config.json 里 mongoUri 用 host.docker.internal）
         # extra_hosts:
         #     - "host.docker.internal:host-gateway"
