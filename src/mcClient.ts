@@ -174,6 +174,9 @@ export class MCClient extends EventEmitter {
     private packetLogWindowStartedAt = 0;
     private packetLogWindowCount = 0;
     private suppressedPacketLogs = 0;
+    // 服务端因聊天/命令校验失败断开后置位：本进程内不再发送聊天与命令，避免"被踢—重连"循环
+    private chatCommandDisabledReason: string | null = null;
+    private chatCommandDisabledLogged = false;
     private eventLoopLagPeakMs = 0;
     private eventLoopTimer: NodeJS.Timeout | null = null;
     private statsTimer: NodeJS.Timeout | null = null;
@@ -1813,6 +1816,10 @@ export class MCClient extends EventEmitter {
 
             if (meta.name === 'disconnect' || meta.name === 'kick_disconnect') {
                 this.log(LogLevel.ERR, `Disconnected: ${JSON.stringify(data)}`);
+                if (this.isChatValidationFailure((data as any)?.reason)) {
+                    this.disableChatSending('服务端拒绝聊天/命令校验（multiplayer.disconnect.chat_validation_failed）；'
+                        + '本端没有聊天签名密钥（minecraft-protocol 的客户端分支不设置 profileKeys），只能发送未签名命令');
+                }
             }
             // play 状态下逐包日志：DEBUG 只打印包名（按秒限流），VERBOSE 才附带数据摘要，
             // 且只在数据包足够小的时候才做 JSON.stringify —— 大整合包每个包都序列化会阻塞事件循环，
@@ -2306,6 +2313,10 @@ export class MCClient extends EventEmitter {
                     + '网络抖动明显时可调大 config.json 的 checkTimeoutInterval。');
             }
 
+            if (this.isChatValidationFailure(reason)) {
+                this.disableChatSending('服务端拒绝聊天/命令校验（multiplayer.disconnect.chat_validation_failed）');
+            }
+
             this.stopConnectionDiagnostics();
             this.scheduleReconnect(DEFAULT_RECONNECT_DELAY_MS);
         });
@@ -2512,6 +2523,15 @@ export class MCClient extends EventEmitter {
         if (idleMs < idleThreshold) return;
 
         const command = String(this.clientOptions?.tpsFallbackCommand ?? (this.status.modLoader === 'forge' ? 'forge tps' : 'neoforge tps')).replace(/^\/+/, '');
+        if (this.chatCommandDisabledReason) {
+            // 服务器会因聊天/命令校验失败直接断开，继续发只会造成"被踢—重连"循环，因此只读 footer
+            if (!this.chatCommandDisabledLogged) {
+                this.chatCommandDisabledLogged = true;
+                this.log(LogLevel.WARN, `[TPS Fallback] 已停用命令方式读取 TPS：${this.chatCommandDisabledReason}`
+                    + '（TPS 将只依赖服务端下发的 playerlist header/footer；如需保留命令方式，请让服务端允许未签名命令或改用能签名的客户端实现）');
+            }
+            return;
+        }
         try {
             this.log(LogLevel.DEBUG, `[TPS Fallback] No TPS update for ${idleMs === Infinity ? 'ever' : `${Math.round(idleMs / 1000)}s`}, requesting via /${command}`);
             this.sendCommand(command);
@@ -2681,7 +2701,29 @@ export class MCClient extends EventEmitter {
         this.emit('statusUpdate', this.getStatus());
     }
 
+    // 服务端返回的断开原因里出现 chat_validation_failed 时，说明它拒绝我们的聊天/命令包。
+    // 这种情况下继续发送只会每次都把连接搞断（表现为"断线重连"循环），因此置位禁用位。
+    private isChatValidationFailure(reason: unknown): boolean {
+        if (reason === undefined || reason === null) return false;
+        let text: string;
+        try {
+            text = typeof reason === 'string' ? reason : JSON.stringify(reason);
+        } catch {
+            text = String(reason);
+        }
+        return /chat_validation_failed|chat_validation/i.test(text);
+    }
+
+    private disableChatSending(reason: string) {
+        if (this.chatCommandDisabledReason) return;
+        this.chatCommandDisabledReason = reason;
+        this.log(LogLevel.WARN, `[Chat] ${reason}；本进程内不再发送聊天/命令，避免反复被服务端断开（玩家列表与 footer 里的 TPS 不受影响）`);
+    }
+
     public sendChat(message: string): void {
+        if (this.chatCommandDisabledReason) {
+            throw new Error(`聊天/命令已停用：${this.chatCommandDisabledReason}`);
+        }
         if (!message || typeof message !== 'string') {
             throw new Error('message must be a non-empty string');
         }
