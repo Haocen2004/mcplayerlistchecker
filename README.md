@@ -191,6 +191,11 @@ A: `minecraft:hello` 就是 login 首包（`ServerboundHelloPacket`）。常见�
 **Q: 被踢并提示 `multiplayer.disconnect.unverified_username`（未验证的用户名）？**
 A: 目标服务器开启了正版验证（online-mode）。请在 `config.json` 中设置 `"microsoft": true`，首次运行按控制台提示完成一次微软设备码登录，凭据会缓存到 `./.minecraft_auth`，之后可自动登录。
 
+**Q: 被踢并提示 `multiplayer.disconnect.chat_validation_failed`（通常在发送 `/neoforge tps` 之后）？**
+A: 服务端拒绝了我们的聊天/命令包。原版客户端的做法是：登录后用正版 token 向 Mojang 申请聊天签名密钥（`player/certificates`）→ 进入世界时发送 `chat_session_update` 声明会话 → 之后聊天/命令都以签名包（`chat_command_signed`）发出；**拿不到密钥时原版会在 UI 上直接禁用聊天输入**，因此永远不会发出会被判为校验失败的包（这也是"原版只会无法发消息、不会被移出游戏"的原因）。
+`minecraft-protocol` 的客户端分支不申请这些密钥（`client.profileKeys` 恒为空），却仍会发送**未签名**命令，于是被严格校验的服务端断开。
+本程序补齐了原版缺失的那一步：`chatSigning`（默认开启，仅正版登录生效）会自动申请证书、构造 `client.profileKeys`，让库发送 `chat_session_update` 并改用 `chat_command_signed`；失败则自动回退到未签名命令，并按**指数退避**重试（默认 10 分钟起、每次翻倍，连续 `tpsCommandMaxFailures`(5) 次后本进程内停用），退避期间 TPS 只读 `playerlist` header/footer（玩家列表不受影响）。可用 `chatSigning: false` 关闭签名、`tpsCommandFailureBackoffMs` / `tpsCommandMaxFailures` 调整退避，或用 `tpsFallbackEnabled: false` 完全关闭命令兜底。
+
 **Q: 26.1.2 服务器的 ping 结果里 `playersOnline` 一直是 0？**
 A: `playersOnline` 来自服务器状态响应（`status`），而玩家明细来自游戏内 `player_info`。如果服务器在空闲时会暂停（`Server empty for 60 seconds, pausing`），状态响应可能暂时只反映机器人自己或为空，以 `/players` 返回的 `players` 数组为准。
 

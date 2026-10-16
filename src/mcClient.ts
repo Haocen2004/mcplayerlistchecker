@@ -2,7 +2,7 @@ import * as mc from 'minecraft-protocol';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, createPrivateKey, createPublicKey, randomUUID } from 'crypto';
 import { applyCompression, CompressionType } from './compression';
 
 // 默认目标版本：Minecraft 26.1.2（NeoForge 26.1.x 是 26.1 的 hotfix，协议号同为 775）。
@@ -27,6 +27,12 @@ const DEFAULT_KEEPALIVE_TIMEOUT_MS = 60_000;
 const DEFAULT_PACKET_LOG_PER_SECOND = 50;
 const DEFAULT_STATS_INTERVAL_MS = 30_000;
 const PACKET_DATA_LOG_MAX_BYTES = 4_096;
+// 服务端拒绝聊天/命令校验（chat_validation_failed）会直接断开连接。由于触发是概率性的
+// （与消息链 acknowledgement/checksum 有关），这里不立即永久放弃，而是指数退避重试，
+// 连续失败达到上限才彻底停用。
+const DEFAULT_TPS_COMMAND_FAILURE_BACKOFF_MS = 600_000;
+const DEFAULT_TPS_COMMAND_MAX_FAILURES = 5;
+const MINECRAFT_CERTIFICATES_URL = 'https://api.minecraftservices.com/player/certificates';
 // play 状态下高频且无信息量的包，不打逐包日志
 const QUIET_PACKET_NAMES = new Set([
     'keep_alive',
@@ -174,9 +180,10 @@ export class MCClient extends EventEmitter {
     private packetLogWindowStartedAt = 0;
     private packetLogWindowCount = 0;
     private suppressedPacketLogs = 0;
-    // 服务端因聊天/命令校验失败断开后置位：本进程内不再发送聊天与命令，避免"被踢—重连"循环
+    // 服务端因聊天/命令校验失败断开后：指数退避重试，连续失败到上限才彻底停用
     private chatCommandDisabledReason: string | null = null;
     private chatCommandDisabledLogged = false;
+    private chatCommandFailureCount = 0;
     private eventLoopLagPeakMs = 0;
     private eventLoopTimer: NodeJS.Timeout | null = null;
     private statsTimer: NodeJS.Timeout | null = null;
@@ -1724,6 +1731,9 @@ export class MCClient extends EventEmitter {
 
         this.startConnectionDiagnostics();
 
+        // 并行申请聊天签名密钥（对齐原版客户端）；失败会自动回退到未签名命令 + 退避保护
+        void this.setupChatProfileKeys(this.client);
+
         // CORE FIX: Intercept outgoing packets
         const oldWrite = this.client.write;
         const allowedEmptyLoginPluginResponses = new Set<number>();
@@ -1800,6 +1810,11 @@ export class MCClient extends EventEmitter {
 
             if ((meta.name === 'position' || meta.name === 'tags') && String(this.client?.state) === 'play') {
                 this.markPlayReady();
+            }
+
+            // 进入世界时确认聊天会话已声明（库只在 play 的 login 包上声明一次，密钥到得晚会错过）
+            if (meta.name === 'login' && String(this.client?.state) === 'play') {
+                this.ensureChatSessionDeclared(this.client);
             }
 
             if (meta.name === 'ping' && String(this.client?.state) === 'configuration') {
@@ -2687,6 +2702,9 @@ export class MCClient extends EventEmitter {
         this.status.tps = tps;
         if (mspt) this.status.mspt = mspt;
         this.lastTpsUpdateAt = Date.now();
+        // 成功拿到 TPS，说明命令链路当前是可用的：重置退避状态
+        this.chatCommandFailureCount = 0;
+        if (!this.chatCommandDisabledReason) this.tpsCommandCooldownUntil = 0;
         this.log(LogLevel.INFO, `[TPS Fallback] Captured TPS=${tps}${mspt ? ` MSPT=${mspt}` : ''}${isOverall ? ' (Overall)' : ''}`);
         this.emitStatusUpdate();
         import('./db').then(db => db.saveHistory({
@@ -2699,6 +2717,97 @@ export class MCClient extends EventEmitter {
 
     private emitStatusUpdate() {
         this.emit('statusUpdate', this.getStatus());
+    }
+
+    // ---- 聊天签名（对齐原版客户端）----
+    // 原版客户端进入世界前会用正版 token 向 Mojang 申请聊天签名密钥（player/certificates），
+    // 然后发送 chat_session_update 声明会话，之后的聊天/命令都以 chat_command_signed（带签名）发出；
+    // 拿不到密钥时，原版客户端直接在 UI 上禁用聊天输入，因此永远不会发出会被服务端判为校验失败的包。
+    // minecraft-protocol 的客户端分支不会申请这些密钥（client.profileKeys 始终为空），
+    // 于是命令只能以未签名的 chat_command 发出；26.1 的服务端在严格校验下会因此断开连接
+    // （multiplayer.disconnect.chat_validation_failed）。这里补齐原版缺失的那一步。
+    private async setupChatProfileKeys(client: any): Promise<void> {
+        if (this.clientOptions?.chatSigning === false) return;
+        if (this.authType !== 'microsoft') return; // 只有正版登录才有可用的 accessToken
+        if (client.profileKeys) return;
+
+        const token = client.session?.accessToken ?? this.readCachedMinecraftToken();
+        if (!token) {
+            this.log(LogLevel.WARN, '[ChatSigning] 未取得正版 accessToken，跳过聊天签名（命令将以未签名方式发送，严格校验的服务端可能拒绝）');
+            return;
+        }
+
+        try {
+            const response = await fetch(MINECRAFT_CERTIFICATES_URL, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+            const data: any = await response.json();
+            if (!data?.keyPair?.privateKey || !data?.keyPair?.publicKey) {
+                throw new Error('响应缺少 keyPair');
+            }
+
+            client.profileKeys = {
+                private: createPrivateKey({ key: data.keyPair.privateKey, format: 'pem' }),
+                public: createPublicKey({ key: data.keyPair.publicKey, format: 'pem' }),
+                signature: Buffer.from(data.publicKeySignature ?? data.publicKeySignatureV2, 'base64'),
+                signatureV2: Buffer.from(data.publicKeySignatureV2 ?? data.publicKeySignature, 'base64'),
+                expiresOn: new Date(data.expiresAt)
+            };
+
+            this.log(LogLevel.INFO, `[ChatSigning] 已取得聊天签名密钥（有效期至 ${data.expiresAt}），命令将使用 chat_command_signed`);
+
+            // 库只在「进入世界」那一刻的 login 包上声明一次会话；如果我们的密钥到得晚，这里补发一次
+            this.ensureChatSessionDeclared(client);
+        } catch (e) {
+            this.log(LogLevel.WARN, `[ChatSigning] 获取聊天签名密钥失败：${(e as Error).message}`
+                + '（命令将以未签名方式发送；若服务端严格校验，程序会自动退避并只读 footer 里的 TPS）');
+        }
+    }
+
+    private ensureChatSessionDeclared(client: any) {
+        try {
+            const mcData = require('minecraft-data')(client.version);
+            if (!mcData.supportFeature('useChatSessions')) return;
+            if (client._session?.uuid) return; // 库已经声明过会话
+            if (!client.profileKeys || !client.cipher) return;
+
+            client._session = { index: 0, uuid: randomUUID() };
+            client.write('chat_session_update', {
+                sessionUUID: client._session.uuid,
+                expireTime: BigInt(client.profileKeys.expiresOn.getTime()),
+                publicKey: client.profileKeys.public.export({ type: 'spki', format: 'der' }),
+                signature: client.profileKeys.signatureV2
+            });
+            this.log(LogLevel.DEBUG, '[ChatSigning] 已补发 chat_session_update（声明聊天会话）');
+        } catch (e) {
+            this.log(LogLevel.DEBUG, `[ChatSigning] 补发 chat_session_update 失败：${(e as Error).message}`);
+        }
+    }
+
+    // account token 兜底：prismarine-auth 的缓存文件里保存着 mca access_token
+    private readCachedMinecraftToken(): string | null {
+        try {
+            const folder = require('path').resolve('./.minecraft_auth');
+            if (!require('fs').existsSync(folder)) return null;
+            for (const name of require('fs').readdirSync(folder)) {
+                if (!name.endsWith('_mca-cache.json')) continue;
+                const raw = JSON.parse(require('fs').readFileSync(require('path').join(folder, name), 'utf8'));
+                const token = raw?.mca?.access_token;
+                const expiresAt = Number(raw?.mca?.obtainedOn ?? 0) + Number(raw?.mca?.expires_in ?? 0) * 1000;
+                if (typeof token === 'string' && token.length > 0 && (!expiresAt || Date.now() < expiresAt)) {
+                    return token;
+                }
+            }
+        } catch (e) {
+            this.log(LogLevel.DEBUG, `[ChatSigning] 读取缓存 token 失败：${(e as Error).message}`);
+        }
+        return null;
     }
 
     // 服务端返回的断开原因里出现 chat_validation_failed 时，说明它拒绝我们的聊天/命令包。
@@ -2716,8 +2825,25 @@ export class MCClient extends EventEmitter {
 
     private disableChatSending(reason: string) {
         if (this.chatCommandDisabledReason) return;
-        this.chatCommandDisabledReason = reason;
-        this.log(LogLevel.WARN, `[Chat] ${reason}；本进程内不再发送聊天/命令，避免反复被服务端断开（玩家列表与 footer 里的 TPS 不受影响）`);
+
+        this.chatCommandFailureCount++;
+        const maxFailures = Number(this.clientOptions?.tpsCommandMaxFailures ?? DEFAULT_TPS_COMMAND_MAX_FAILURES);
+        const baseBackoff = Number(this.clientOptions?.tpsCommandFailureBackoffMs ?? DEFAULT_TPS_COMMAND_FAILURE_BACKOFF_MS);
+
+        if (Number.isFinite(maxFailures) && maxFailures > 0 && this.chatCommandFailureCount >= maxFailures) {
+            this.chatCommandDisabledReason = reason;
+            this.log(LogLevel.WARN, `[Chat] ${reason}；已连续失败 ${this.chatCommandFailureCount} 次，`
+                + '本进程内不再发送聊天/命令（玩家列表与 footer 里的 TPS 不受影响）');
+            return;
+        }
+
+        const backoffMs = Number.isFinite(baseBackoff) && baseBackoff > 0
+            ? baseBackoff * Math.pow(2, this.chatCommandFailureCount - 1)
+            : 0;
+        this.tpsCommandCooldownUntil = Date.now() + backoffMs;
+        this.log(LogLevel.WARN, `[Chat] ${reason}；这是第 ${this.chatCommandFailureCount} 次，`
+            + `命令方式将退避 ${Math.round(backoffMs / 60_000)} 分钟后重试（期间 TPS 只读 footer），`
+            + `连续失败 ${Number.isFinite(maxFailures) && maxFailures > 0 ? maxFailures : DEFAULT_TPS_COMMAND_MAX_FAILURES} 次后彻底停用`);
     }
 
     public sendChat(message: string): void {
