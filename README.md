@@ -104,7 +104,40 @@ NeoForge 服务器如果要求额外的 mod payload，本程序会在 `neoforgeP
 npm run server
 ```
 
-默认监听 `0.0.0.0:25566`。客户端进入服务器列表连接 `127.0.0.1:25566`，采集完成后程序会写入 `.neoforge_probe_cache.json`，随后继续完成 configuration 流程；之后正常 client 模式会按目标服务器 `host:port_协议版本` 的 hash 读取这些声明。
+默认监听 `0.0.0.0:25566`。客户端进入服务器列表连接 `127.0.0.1:25566`，采集完成后程序会写入 `.neoforge_probe_cache.json`；之后正常 client 模式会按目标服务器 `host:port_协议版本` 的 hash 读取这些声明。采集完成后默认**不再继续 configuration**（本端只是采集用的最小服务端，继续下发数据会被真实 26.1 客户端判为协议错误），客户端停在"正在加入世界"或稍后掉线属正常，声明此时已写入。需要旧行为（继续完成配置流程）可设 `serverModeContinueAfterCapture: true`。
+
+### 仅采集接口（HTTP，模组包更新后刷新声明的推荐方式）
+
+主监控运行期间可以按需开启一个「只监听、不登录游戏」的采集服务端，**不占用游戏账号**，让真实客户端连一次即可刷新频道声明：
+
+```json
+{
+  "captureApiEnabled": true,
+  "captureApiPort": 25577,
+  "captureApiTimeoutMs": 180000,
+  "serverModeCaptureForce": false
+}
+```
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/capture/status` | 是否监听、目标服务器、最近一次采集结果（条数/时间/缓存 key）与错误 |
+| POST | `/capture/start` | 启动采集服务端，body 可选 `{ "port": 25577, "timeoutMs": 180000, "reconnect": true }` |
+| POST | `/capture/stop` | 停止采集服务端 |
+
+```bash
+curl -X POST http://localhost:3000/capture/start
+# 用真实客户端（26.1.2 + 对应整合包）连接 <本机IP>:25577
+curl http://localhost:3000/capture/status      # 看 lastCapture
+curl -X POST http://localhost:3000/capture/stop
+```
+
+采集成功后主连接会**自动重连**并加载最新声明（`"reconnect": false` 可关闭）。要点：
+
+* 缓存 key 由 `config.json` 里的 `host:port` + 协议号决定，所以 host/port 必须指向**真实目标服务器**，否则声明会写到错误的 key 下。
+* 若本次采集条数不足已有缓存的一半（且已有超过 100 条），会判定为异常采集并保留旧数据（防止用未装 mod 的客户端把缓存冲掉）；确需覆盖设 `serverModeCaptureForce: true`。
+* 采集端与主监控可同时运行；模组包更新（频道版本/必需性变化）后无需重启进程，也不需要改 `mode`。
+
 
 ### 启动参数 (CLI)
 

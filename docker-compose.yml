@@ -16,6 +16,9 @@ services:
         restart: unless-stopped
         ports:
             - "3010:3000"
+            # 仅采集接口的监听端口（config.json 设 captureApiEnabled: true / captureApiPort: 25577）
+            # 模组包更新后：curl -X POST http://localhost:3010/capture/start，再用真实客户端连 <本机IP>:25577
+            - "25577:25577"
         volumes:
             - ./config.docker.json:/app/config.json:ro
             - ./.minecraft_auth:/app/.minecraft_auth
