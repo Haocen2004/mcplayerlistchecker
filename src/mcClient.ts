@@ -150,6 +150,10 @@ export interface ServerStatus {
     mods?: string[];
     tps?: string;
     mspt?: string;
+    /** 服务端是否强制安全聊天（聊天/命令需要签名）。来源：status ping 与 login success 的 enforcesSecureChat */
+    enforcesSecureChat?: boolean;
+    /** 本连接是否已取得聊天签名密钥（取得后命令走 chat_command_signed） */
+    chatSigning?: boolean;
 }
 
 export class MCClient extends EventEmitter {
@@ -184,6 +188,7 @@ export class MCClient extends EventEmitter {
     private chatCommandDisabledReason: string | null = null;
     private chatCommandDisabledLogged = false;
     private chatCommandFailureCount = 0;
+    private chatSigningAttempted = false;
     private eventLoopLagPeakMs = 0;
     private eventLoopTimer: NodeJS.Timeout | null = null;
     private statsTimer: NodeJS.Timeout | null = null;
@@ -1432,7 +1437,9 @@ export class MCClient extends EventEmitter {
                         isNeoForge,
                         modLoader,
                         fmlVersion: res.forgeData ? 'FML3' : (legacyModinfo ? 'FML' : undefined),
-                        mods: Array.from(mods.keys())
+                        mods: Array.from(mods.keys()),
+                        // status ping 会告知服务端是否强制安全聊天；只有它为 true 时才需要申请聊天签名密钥
+                        enforcesSecureChat: res.enforcesSecureChat === true
                     });
                 }
             });
@@ -1683,6 +1690,7 @@ export class MCClient extends EventEmitter {
         this.legacyForgeServerMods = new Map(this.serverModVersions);
         this.loadNeoForgeProbeCache(resolvedVersion, modLoader, status.protocol);
         this.neoForgePlayCacheSaved = false;
+        this.chatSigningAttempted = false;
         this.configureYggdrasilJoinThrottle(modLoader);
 
         // Legacy Forge (1.7-1.12.2) advertises FML; modern Forge uses FML3.
@@ -2362,6 +2370,18 @@ export class MCClient extends EventEmitter {
             this.tpsCommandSuppressUntil = 0;
             this.disableUpstreamCommandTreeValidation();
             this.overrideSelectKnownPacks();
+
+            // login success 也会带上 enforcesSecureChat：若 ping 没提供而这里为 true，同样按需申请签名密钥
+            const enforcesSecureChat = (packet as any)?.enforcesSecureChat === true;
+            if (enforcesSecureChat) {
+                if (!this.status.enforcesSecureChat) {
+                    this.log(LogLevel.INFO, '[ChatSigning] login success 表明服务端要求安全聊天，开始申请聊天签名密钥');
+                }
+                this.status.enforcesSecureChat = true;
+                void this.setupChatProfileKeys(this.client);
+            }
+            this.status.chatSigning = !!(this.client as any)?.profileKeys;
+
             this.emit('connected');
         });
     }
@@ -2729,13 +2749,23 @@ export class MCClient extends EventEmitter {
     private async setupChatProfileKeys(client: any): Promise<void> {
         if (this.clientOptions?.chatSigning === false) return;
         if (this.authType !== 'microsoft') return; // 只有正版登录才有可用的 accessToken
-        if (client.profileKeys) return;
+        if (client.profileKeys) return; // 认证流程/库已提供密钥（实测 microsoft 登录下通常已存在），无需重复申请
+        if (this.chatSigningAttempted) return;
+
+        // 只在服务端要求安全聊天时才去申请密钥（enforcesSecureChat 来自 status ping / login success）
+        if (!this.status.enforcesSecureChat) {
+            this.log(LogLevel.DEBUG, '[ChatSigning] 服务端未要求安全聊天（enforcesSecureChat 非 true），跳过申请聊天签名密钥');
+            return;
+        }
 
         const token = client.session?.accessToken ?? this.readCachedMinecraftToken();
         if (!token) {
-            this.log(LogLevel.WARN, '[ChatSigning] 未取得正版 accessToken，跳过聊天签名（命令将以未签名方式发送，严格校验的服务端可能拒绝）');
+            // 认证可能还没完成：不置位 attempted，等 login success 后再试一次
+            this.log(LogLevel.DEBUG, '[ChatSigning] 暂未取得正版 accessToken（认证尚未完成），稍后重试');
             return;
         }
+
+        this.chatSigningAttempted = true;
 
         try {
             const response = await fetch(MINECRAFT_CERTIFICATES_URL, {
@@ -2761,6 +2791,7 @@ export class MCClient extends EventEmitter {
             };
 
             this.log(LogLevel.INFO, `[ChatSigning] 已取得聊天签名密钥（有效期至 ${data.expiresAt}），命令将使用 chat_command_signed`);
+            this.status.chatSigning = true;
 
             // 库只在「进入世界」那一刻的 login 包上声明一次会话；如果我们的密钥到得晚，这里补发一次
             this.ensureChatSessionDeclared(client);
