@@ -33,6 +33,9 @@ const PACKET_DATA_LOG_MAX_BYTES = 4_096;
 const DEFAULT_TPS_COMMAND_FAILURE_BACKOFF_MS = 600_000;
 const DEFAULT_TPS_COMMAND_MAX_FAILURES = 5;
 const MINECRAFT_CERTIFICATES_URL = 'https://api.minecraftservices.com/player/certificates';
+// 申请聊天签名密钥时最多阻塞这么久（为了保证进入世界前密钥就绪、会话能及时声明）；
+// 超时后不再阻塞连接流程，改为后台继续申请。
+const DEFAULT_CHAT_SIGNING_TIMEOUT_MS = 30_000;
 // play 状态下高频且无信息量的包，不打逐包日志
 const QUIET_PACKET_NAMES = new Set([
     'keep_alive',
@@ -189,6 +192,7 @@ export class MCClient extends EventEmitter {
     private chatCommandDisabledLogged = false;
     private chatCommandFailureCount = 0;
     private chatSigningAttempted = false;
+    private chatSigningSkipLogged = false;
     private eventLoopLagPeakMs = 0;
     private eventLoopTimer: NodeJS.Timeout | null = null;
     private statsTimer: NodeJS.Timeout | null = null;
@@ -1739,8 +1743,9 @@ export class MCClient extends EventEmitter {
 
         this.startConnectionDiagnostics();
 
-        // 并行申请聊天签名密钥（对齐原版客户端）；失败会自动回退到未签名命令 + 退避保护
-        void this.setupChatProfileKeys(this.client);
+        // 阻塞等待聊天签名密钥申请（最多 chatSigningTimeoutMs，超时转后台），
+        // 这样进入世界前密钥就绪、会话能按原版时机声明
+        await this.setupChatProfileKeys(this.client);
 
         // CORE FIX: Intercept outgoing packets
         const oldWrite = this.client.write;
@@ -2558,6 +2563,18 @@ export class MCClient extends EventEmitter {
         if (idleMs < idleThreshold) return;
 
         const command = String(this.clientOptions?.tpsFallbackCommand ?? (this.status.modLoader === 'forge' ? 'forge tps' : 'neoforge tps')).replace(/^\/+/, '');
+
+        // 服务端强制安全聊天（enforcesSecureChat=true）而本端还没有签名密钥时，主动探测必然被拒
+        // （服务端会直接断开），因此直接跳过——与原版"没有密钥就不发消息"的行为一致。
+        if (this.status.enforcesSecureChat && !(this.client as any)?.profileKeys) {
+            if (!this.chatSigningSkipLogged) {
+                this.chatSigningSkipLogged = true;
+                this.log(LogLevel.WARN, '[TPS Fallback] 服务端要求安全聊天但本端尚无签名密钥，已跳过主动 TPS 探测'
+                    + '（TPS 只读 playerlist header/footer；签名密钥就绪后会自动恢复探测）');
+            }
+            return;
+        }
+
         if (this.chatCommandDisabledReason) {
             // 服务器会因聊天/命令校验失败直接断开，继续发只会造成"被踢—重连"循环，因此只读 footer
             if (!this.chatCommandDisabledLogged) {
@@ -2767,6 +2784,29 @@ export class MCClient extends EventEmitter {
 
         this.chatSigningAttempted = true;
 
+        const timeoutMs = this.getChatSigningTimeoutMs();
+        const request = this.requestChatProfileKeys(client, token);
+
+        // 阻塞等待最多 timeoutMs，保证密钥能在进入世界前就绪（原版也是在进服前就持有密钥）；
+        // 超时不取消请求，只是转为后台继续，完成后若已进入世界会补发 chat_session_update。
+        await Promise.race([
+            request,
+            new Promise<void>(resolve => { const timer = setTimeout(resolve, timeoutMs); timer.unref?.(); })
+        ]);
+
+        if (!client.profileKeys) {
+            this.log(LogLevel.WARN, `[ChatSigning] 申请未在 ${timeoutMs}ms 内完成，转入后台继续；`
+                + '期间会跳过主动 TPS 探测（服务端要求签名时，未签名的命令会被断开）');
+            void request.catch(() => {});
+        }
+    }
+
+    private getChatSigningTimeoutMs(): number {
+        const configured = Number(this.clientOptions?.chatSigningTimeoutMs);
+        return Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_CHAT_SIGNING_TIMEOUT_MS;
+    }
+
+    private async requestChatProfileKeys(client: any, token: string): Promise<void> {
         try {
             const response = await fetch(MINECRAFT_CERTIFICATES_URL, {
                 method: 'POST',
@@ -2792,6 +2832,7 @@ export class MCClient extends EventEmitter {
 
             this.log(LogLevel.INFO, `[ChatSigning] 已取得聊天签名密钥（有效期至 ${data.expiresAt}），命令将使用 chat_command_signed`);
             this.status.chatSigning = true;
+            this.chatSigningSkipLogged = false;
 
             // 库只在「进入世界」那一刻的 login 包上声明一次会话；如果我们的密钥到得晚，这里补发一次
             this.ensureChatSessionDeclared(client);
@@ -2803,6 +2844,9 @@ export class MCClient extends EventEmitter {
 
     private ensureChatSessionDeclared(client: any) {
         try {
+            // chat_session_update 只在 play 阶段有效：configuration 阶段的补发会被服务端忽略/报错
+            if (String(client.state) !== 'play') return;
+
             const mcData = require('minecraft-data')(client.version);
             if (!mcData.supportFeature('useChatSessions')) return;
             if (client._session?.uuid) return; // 库已经声明过会话

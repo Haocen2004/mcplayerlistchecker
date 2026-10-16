@@ -197,6 +197,8 @@ A: 服务端拒绝了我们的聊天/命令包。原版客户端的做法是：�
 本程序补齐了原版缺失的那一步：`chatSigning`（默认开启，仅正版登录生效）会在**服务端要求安全聊天时**（`enforcesSecureChat`，来自 status ping 与 login success）申请/复用聊天签名密钥，并在进入世界时确认 `chat_session_update` 已发出（库只在该时刻检查一次条件，错过就永久不发，这正是"随机被踢"的根源）；失败则自动回退到未签名命令，并按**指数退避**重试（默认 10 分钟起、每次翻倍，连续 `tpsCommandMaxFailures`(5) 次后本进程内停用），退避期间 TPS 只读 `playerlist` header/footer（玩家列表不受影响）。可用 `chatSigning: false` 关闭签名、`tpsCommandFailureBackoffMs` / `tpsCommandMaxFailures` 调整退避，或用 `tpsFallbackEnabled: false` 完全关闭命令兜底。
 `GET /status` 与 `/players` 会返回两个诊断字段：`enforcesSecureChat`（服务端是否强制安全聊天）与 `chatSigning`（本连接是否已具备签名密钥）。
 
+相关配置：`chatSigning`（默认 true）、`chatSigningTimeoutMs`（默认 30000，申请签名密钥时最多阻塞这么久，超时后转为后台继续申请）、`tpsCommandFailureBackoffMs`、`tpsCommandMaxFailures`。**服务端要求安全聊天而本端尚无签名密钥时，程序会跳过主动 TPS 探测**（发送未签名命令会直接被断开），此时 TPS 只读 footer，密钥就绪后自动恢复探测。
+
 **Q: 26.1.2 服务器的 ping 结果里 `playersOnline` 一直是 0？**
 A: `playersOnline` 来自服务器状态响应（`status`），而玩家明细来自游戏内 `player_info`。如果服务器在空闲时会暂停（`Server empty for 60 seconds, pausing`），状态响应可能暂时只反映机器人自己或为空，以 `/players` 返回的 `players` 数组为准。
 

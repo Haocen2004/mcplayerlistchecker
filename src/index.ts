@@ -125,6 +125,10 @@ async function bootstrap() {
     if (config.tpsFallbackCooldownMs !== undefined) mcClient.clientOptions.tpsFallbackCooldownMs = config.tpsFallbackCooldownMs;
     if (config.tpsFallbackResponseWindowMs !== undefined) mcClient.clientOptions.tpsFallbackResponseWindowMs = config.tpsFallbackResponseWindowMs;
     if (config.tpsFallbackCommand !== undefined) mcClient.clientOptions.tpsFallbackCommand = config.tpsFallbackCommand;
+    if (config.chatSigning !== undefined) mcClient.clientOptions.chatSigning = config.chatSigning;
+    if (config.chatSigningTimeoutMs !== undefined) mcClient.clientOptions.chatSigningTimeoutMs = config.chatSigningTimeoutMs;
+    if (config.tpsCommandFailureBackoffMs !== undefined) mcClient.clientOptions.tpsCommandFailureBackoffMs = config.tpsCommandFailureBackoffMs;
+    if (config.tpsCommandMaxFailures !== undefined) mcClient.clientOptions.tpsCommandMaxFailures = config.tpsCommandMaxFailures;
 
     // 仅采集接口：模组包更新后可用 POST /capture/start 临时开启一个只监听、不登录游戏的
     // 采集服务端，让真实客户端连一次刷新频道声明；采集完成后主连接会自动重连以使用新声明。
