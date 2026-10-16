@@ -5,6 +5,7 @@ import { MCClient, LogLevel } from './mcClient';
 import { CompressionType } from './compression';
 import { startApiServer } from './api';
 import { startNeoForgeConfigServer } from './neoforgeConfigServer';
+import { captureController } from './captureApi';
 
 const DEFAULT_LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
 
@@ -124,6 +125,23 @@ async function bootstrap() {
     if (config.tpsFallbackCooldownMs !== undefined) mcClient.clientOptions.tpsFallbackCooldownMs = config.tpsFallbackCooldownMs;
     if (config.tpsFallbackResponseWindowMs !== undefined) mcClient.clientOptions.tpsFallbackResponseWindowMs = config.tpsFallbackResponseWindowMs;
     if (config.tpsFallbackCommand !== undefined) mcClient.clientOptions.tpsFallbackCommand = config.tpsFallbackCommand;
+
+    // 仅采集接口：模组包更新后可用 POST /capture/start 临时开启一个只监听、不登录游戏的
+    // 采集服务端，让真实客户端连一次刷新频道声明；采集完成后主连接会自动重连以使用新声明。
+    if (config.captureApiEnabled) {
+        const capturePort = Number(config.captureApiPort || 25577);
+        captureController.configure({
+            targetHost: host,
+            targetPort: port,
+            minecraftVersion: config.minecraftVersion || '26.1.2',
+            cacheFile: config.neoforgeProbeCacheFile,
+            defaultPort: capturePort,
+            defaultTimeoutMs: Number(config.captureApiTimeoutMs || 180000),
+            forceOverwrite: config.serverModeCaptureForce === true
+        });
+        captureController.setReconnectHandler(() => mcClient.reloadNeoForgeProbeCache());
+        console.log(`[Capture API] 已启用：POST /capture/start 可在 ${capturePort} 端口开启仅采集服务端（不占用游戏账号）`);
+    }
 
     if (authType === 'microsoft') {
         mcClient.on('connected', () => {

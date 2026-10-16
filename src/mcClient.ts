@@ -1628,6 +1628,23 @@ export class MCClient extends EventEmitter {
         }
     }
 
+    // 采集接口（POST /capture/start）刷新缓存后调用：清空内存中的 probe 状态并尽快重连，
+    // 让真实客户端刚采集到的最新频道声明立即生效（无需重启进程）。
+    public reloadNeoForgeProbeCache() {
+        this.neoForgeProbeCacheKey = null;
+        this.neoForgeProbeCacheAddress = null;
+        this.neoForgeProbeCacheProtocolVersion = null;
+        this.neoForgeProbeCacheModLoader = null;
+        this.neoForgeProbeChannels.clear();
+        this.neoForgeAcceptedChannels.clear();
+        this.neoForgeProbeDefaultsByNamespace.clear();
+        this.lastNeoForgeFailureChannel = null;
+        this.neoForgePlayCacheSaved = false;
+        this.pendingNeoForgeProbeReconnect = false;
+        this.log(LogLevel.INFO, '[Capture API] 已刷新 NeoForge 频道声明缓存，重连以使用最新声明');
+        this.scheduleReconnect(1000);
+    }
+
     public async connect() {
         if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
         this.cleanup();

@@ -2,6 +2,7 @@ import express from 'express';
 import { Server } from 'ws';
 import { createServer } from 'http';
 import { MCClient, Player } from './mcClient';
+import { captureController } from './captureApi';
 
 class ApiError extends Error {
     constructor(public statusCode: number, message: string) {
@@ -75,6 +76,26 @@ export function startApiServer(mcClient: MCClient, port: number = 3000) {
             const { status, error } = toHttpError(e);
             res.status(status).json({ ok: false, error });
         }
+    });
+
+    // ---- 仅采集接口 ----
+    // 用于模组包更新后刷新 NeoForge 频道声明：开启一个只监听、不登录游戏的采集服务端，
+    // 让真实客户端连上来一次即可把最新声明写入缓存（主连接随后自动重连并生效）。
+    app.get('/capture/status', (_req, res) => {
+        res.json(captureController.status());
+    });
+
+    app.post('/capture/start', (req, res) => {
+        try {
+            res.json(captureController.start(req.body));
+        } catch (e) {
+            const { status, error } = toHttpError(e);
+            res.status(status === 503 ? 400 : status).json({ ok: false, error });
+        }
+    });
+
+    app.post('/capture/stop', (_req, res) => {
+        res.json(captureController.stop());
     });
 
     wss.on('connection', (ws) => {

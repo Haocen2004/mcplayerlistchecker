@@ -48,6 +48,14 @@ export interface NeoForgeConfigServerOptions {
      * 默认情况下，若本次收到的声明不到已有的一半（且已有超过 100 条），会判定为异常采集并保留旧数据。
      */
     forceOverwrite?: boolean;
+    /** 采集成功写入缓存后的回调（供 /capture 接口记录状态、触发主连接重连） */
+    onCaptureCompleted?: (result: {
+        declarations: number;
+        cacheKey: string;
+        cacheFile: string;
+        address: string;
+        protocolVersion: string;
+    }) => void;
 }
 
 // NeoForge 协商使用的内建通道（与 src/mcClient.ts 保持同步）。
@@ -294,6 +302,18 @@ function saveCapturedDeclarations(options: NeoForgeConfigServerOptions, declarat
 
     writeCache(cachePath, cache);
     console.log(`[NeoForge Capture] Saved ${declarations.length} declarations to ${cachePath} (${cacheKey})`);
+
+    try {
+        options.onCaptureCompleted?.({
+            declarations: declarations.length,
+            cacheKey,
+            cacheFile: cachePath,
+            address: `${options.targetHost.toLowerCase()}:${options.targetPort}`,
+            protocolVersion
+        });
+    } catch (e) {
+        console.error(`[NeoForge Capture] onCaptureCompleted 回调失败：${(e as Error).message}`);
+    }
 }
 
 function startCaptureHandshake(client: any, options: NeoForgeConfigServerOptions, finish: () => void) {
