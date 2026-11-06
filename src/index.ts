@@ -118,6 +118,10 @@ async function bootstrap() {
     if (config.neoforgeChannels) mcClient.clientOptions.neoforgeChannels = config.neoforgeChannels;
     if (config.legacyForgeMods) mcClient.clientOptions.legacyForgeMods = config.legacyForgeMods;
     if (config.forgeMods) mcClient.clientOptions.forgeMods = config.forgeMods;
+    if (config.forgeMirrorModList !== undefined) mcClient.clientOptions.forgeMirrorModList = config.forgeMirrorModList;
+    if (config.forgeMirrorChannels !== undefined) mcClient.clientOptions.forgeMirrorChannels = config.forgeMirrorChannels;
+    if (config.forgeSkipHandshake !== undefined) mcClient.clientOptions.forgeSkipHandshake = config.forgeSkipHandshake;
+    if (config.forgeLoginChannelReply !== undefined) mcClient.clientOptions.forgeLoginChannelReply = config.forgeLoginChannelReply;
     if (config.hideErrors !== undefined) mcClient.clientOptions.hideErrors = config.hideErrors;
     if (config.tpsFallbackEnabled !== undefined) mcClient.clientOptions.tpsFallbackEnabled = config.tpsFallbackEnabled;
     if (config.tpsFallbackIdleMs !== undefined) mcClient.clientOptions.tpsFallbackIdleMs = config.tpsFallbackIdleMs;

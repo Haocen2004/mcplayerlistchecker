@@ -94,6 +94,23 @@ NeoForge 服务器如果要求额外的 mod payload，本程序会在 `neoforgeP
 
 `neoforgeProbe` 的候选声明、probe 缓存格式与 1.21.x 完全共用；已连接的 1.21.x 服务器缓存不会被 26.1.2 的缓存覆盖（key 不同）。
 
+### Minecraft 1.20.1（Forge FML3）适配说明
+
+1.20.1 走的是 Forge 的 **FML3** 登录握手（`fml:handshake` + `fml:loginwrapper`），与 26.1 的 NeoForge 流程完全不同。实测通过（All the Mods 9 Expert，349 mods / 204 channels / 61 registries）：
+
+1. **必须上报完整 mod 列表**：mod 服要求客户端上报全部 mod，缺任何一个都会被拒（伪装原版客户端会被直接断开：`This server has mods that require Forge to be installed on the client`）。本程序默认回显服务端的 mod/channel/registry 列表（`forgeMirrorModList`，默认 `true`）。
+2. **各 mod 的登录包必须在 `fml:handshake` 通道上 ACK**：回显通道后，服务端会为每个 mod 的登录数据下发 `fml:loginwrapper` 询问（如 `silgear:network`）。按 Forge 源码，待确认索引记录在 `HandshakeHandler.sentMessages` 中、**与通道无关**，而应答的目标通道由客户端决定，因此在 `fml:handshake` 通道回一个 `C2SAcknowledge`（单字节 `0x63` 即 99）即可清掉索引、推进握手（`forgeLoginChannelReply: "handshake-ack"`，默认）。三种错误做法及其现象：
+   * 不回应 → 服务端一直等，`Took too long to log in` 后静默断开（登录阶段零收包）
+   * 在 mod 通道本身回空载荷 / 99 → `multiplayer.disconnect.unexpected_query_response`（该通道没注册这个 discriminator）
+   * 回 `success=false` 的"不理解" → 同样被判为未处理并断开
+3. **ACK 与内层载荷格式**：`fml:loginwrapper` 外层是 `[channel][varint 长度][内层]`，内层第一个字节是 **discriminator（单字节，不是 varint）**，`C2SAcknowledge` = `0x63`。
+4. **加密握手与聊天签名密钥**：`minecraft-protocol` 用 `client.profileKeys == null` 判断是否发送 verify token，过早设置会让正版服务器回 `encryptionLoginError`。本程序把申请到的密钥暂存到 `pendingProfileKeys`，登录成功（或进入 play）后才应用；同时兼容 Mojang 返回的 PEM / 裸 DER 两种密钥格式。
+5. **阻塞式申请的时序**：聊天签名密钥申请最多阻塞 `chatSigningTimeoutMs`（默认 30s），但**必须在所有登录监听器注册之后**执行，否则证书接口慢时会推迟 `login_plugin_request` 的注册，导致服务端把 FML 登录包发完而我们一个都没答上。
+
+已验证结果（`mc.misterplus.plus:25565`，ATM9 Expert）：进入 play、玩家列表正常、`/forge tps` 返回 `TPS=20.000 MSPT=16.794`。
+
+相关配置：`forgeSkipHandshake`（默认 `false`；置 `true` 会伪装原版客户端、跳过 FML 握手，仅适用于允许原版进入的服）、`forgeMirrorModList`、`forgeLoginChannelReply`。
+
 连接 1.12.2 Forge 服务器时，程序会在登录后通过 `REGISTER` 注册旧版 Forge 频道，并按 `FML|HS` 的 ServerHello → ClientHello/ModList → RegistryData → HandshakeAck 流程完成握手。默认客户端 mod 列表优先从服务器 ping 返回的 `modinfo.modList` 自动生成；如果你的服务器 ping 未返回完整 modinfo，可显式配置 `legacyForgeMods` 或 `forgeMods`。
 
 ### NeoForge Server 采集模式

@@ -193,6 +193,8 @@ export class MCClient extends EventEmitter {
     private chatCommandFailureCount = 0;
     private chatSigningAttempted = false;
     private chatSigningSkipLogged = false;
+    // 已申请到但尚未应用的聊天签名密钥（必须在加密握手完成后才能赋给 client.profileKeys）
+    private pendingProfileKeys: any = null;
     private eventLoopLagPeakMs = 0;
     private eventLoopTimer: NodeJS.Timeout | null = null;
     private statsTimer: NodeJS.Timeout | null = null;
@@ -218,6 +220,8 @@ export class MCClient extends EventEmitter {
     private legacyForgeHandshakeState: 'idle' | 'waiting_server_data' | 'waiting_server_complete' | 'pending_complete' | 'complete' = 'idle';
     private legacyForgeFmlProtocolVersion = LEGACY_FORGE_PROTOCOL_VERSION;
     private legacyForgeServerMods: Map<string, string> = new Map();
+    // FML3 登录阶段各 mod 登录通道的请求次数（这些通道无法伪造内容，只回"不理解"）
+    private unknownForgeLoginChannels: Map<string, number> = new Map();
     public clientOptions: any = {};
 
     constructor(host: string, port: number = 25565, username: string = 'PlayerListBot', logLevel: LogLevel = LogLevel.INFO, authType: 'microsoft' | 'mojang' = 'mojang', compressionType: CompressionType = 'zlib') {
@@ -1699,7 +1703,12 @@ export class MCClient extends EventEmitter {
 
         // Legacy Forge (1.7-1.12.2) advertises FML; modern Forge uses FML3.
         const fmlMarker = legacyForge ? '\0FML\0' : '\0FML3\0';
-        const serverHost = status.isForge ? `${this.host}${fmlMarker}` : this.host;
+        // forgeSkipHandshake: 不在 serverHost 里带 FML 标记，服务端会把本连接当作原版(VANILLA)连接，
+        // 从而跳过整套 FML 登录握手（也就不会下发各 mod 的登录包——那些包必须由对应 mod 真实应答，
+        // 伪客户端无法伪造）。代价是拿不到 mod 通道，但玩家列表/TPS 仍然可用。
+        const serverHost = status.isForge && this.clientOptions?.forgeSkipHandshake !== true
+            ? `${this.host}${fmlMarker}`
+            : this.host;
 
         // 真实服务端的 login 首包（ServerboundHelloPacket，NeoForge 日志里显示为
         // 'serverbound/minecraft:hello'）用 readUtf(16) 读取玩家名：名字超过 16 字符时服务端会直接抛
@@ -1743,9 +1752,9 @@ export class MCClient extends EventEmitter {
 
         this.startConnectionDiagnostics();
 
-        // 阻塞等待聊天签名密钥申请（最多 chatSigningTimeoutMs，超时转后台），
-        // 这样进入世界前密钥就绪、会话能按原版时机声明
-        await this.setupChatProfileKeys(this.client);
+        // 注意：聊天签名密钥的申请（最多阻塞 chatSigningTimeoutMs）必须放在所有登录/握手监听器
+        // 注册之后（见本方法末尾）。否则证书接口慢时会推迟 login_plugin_request 的注册，
+        // 服务器早把 FML 登录包发完 → 我们一个都答不上来，表现为登录阶段长时间零收包。
 
         // CORE FIX: Intercept outgoing packets
         const oldWrite = this.client.write;
@@ -1754,6 +1763,9 @@ export class MCClient extends EventEmitter {
             if (data === undefined || data.length === 0) {
                 allowedEmptyLoginPluginResponses.add(messageId);
             }
+
+            // 记录每一笔回应，便于把服务端断开（unexpected_query_response）与具体 msgId 对应起来
+            this.log(LogLevel.DEBUG, `[Handshake] -> login_plugin_response msgId=${messageId} dataLen=${data?.length ?? 0}`);
 
             const params = data === undefined
                 ? { messageId }
@@ -2037,15 +2049,27 @@ export class MCClient extends EventEmitter {
                             console.log(`[Handshake] ModList: ${modCount} mods, ${chanCount} channels, ${regCount} registries`);
 
                             // C2SModListReply (ID: 2)
-                            // Ref: MCC Protocol18Forge.cs
+                            // mod 服（FML3，如 ATM9 Expert）要求客户端上报全部 mod，缺任何一个都会拒绝进入，
+                            // 因此默认回显服务器的 mod/channel/registry 列表，让服务器认为 mod 集合一致。
+                            // 代价是服务器随后会为每个 mod 的登录通道下发 fml:loginwrapper 请求，
+                            // 伪客户端无法应答其内容；这些请求必须逐个回应"不理解"（见下方 else 分支），
+                            // 否则服务器会一直等待，最终表现为登录阶段长时间无收包。
+                            const mirrorServerModList = this.clientOptions?.forgeMirrorModList !== false;
+                            const clientMods = mirrorServerModList ? mods : [];
+                            const clientChans = mirrorServerModList ? chans : [];
+                            const clientRegs = mirrorServerModList ? regs : [];
+                            this.log(LogLevel.DEBUG, `[Handshake] C2SModListReply 上报 ${clientMods.length} mods / `
+                                + `${clientChans.length} channels / ${clientRegs.length} registries`
+                                + `（服务器侧 ${modCount}/${chanCount}/${regCount}${mirrorServerModList ? '，已开启回显' : '，按 vanilla 上报'}）`);
+
                             const reply = Buffer.concat([
                                 this.writeVarInt(2), // Packet ID
-                                this.writeVarInt(modCount),
-                                Buffer.concat(mods.map(m => this.writeString(m))),
-                                this.writeVarInt(chanCount),
-                                Buffer.concat(chans.map(c => Buffer.concat([this.writeString(c.n), this.writeString(c.v)]))),
-                                this.writeVarInt(regCount),
-                                Buffer.concat(regs.map(r => Buffer.concat([this.writeString(r), this.writeString('')]))) // Version must be empty string
+                                this.writeVarInt(clientMods.length),
+                                Buffer.concat(clientMods.map(m => this.writeString(m))),
+                                this.writeVarInt(clientChans.length),
+                                Buffer.concat(clientChans.map(c => Buffer.concat([this.writeString(c.n), this.writeString(c.v)]))),
+                                this.writeVarInt(clientRegs.length),
+                                Buffer.concat(clientRegs.map(r => Buffer.concat([this.writeString(r), this.writeString('')]))) // Version must be empty string
                             ]);
 
                             wrappedPayload = this.wrapFmlLoginPayload('fml:handshake', reply);
@@ -2054,11 +2078,12 @@ export class MCClient extends EventEmitter {
                             wrappedPayload = this.wrapFmlLoginPayload('fml:handshake', this.writeVarInt(99));
                             this.log(LogLevel.DEBUG, `[Handshake] Sending ACK (99) for PacketID: ${packetID}`);
                         } else if (packetID === 5 || packetID === 6) {
-                            // FML3 ModDataList and ChannelMismatchData are informational here.
-                            this.log(LogLevel.DEBUG, `[Handshake] Ignoring informational FML3 packet ${packetID}; no response sent`);
+                            // ModDataList / ChannelMismatchData 是单向信息包：原版客户端不回应，
+                            // 若回应会被服务端判为 multiplayer.disconnect.unexpected_query_response。
+                            this.log(LogLevel.DEBUG, `[Handshake] Informational FML3 packet ${packetID}; no response sent (msgId=${packet.messageId})`);
                             return;
                         } else {
-                            this.log(LogLevel.DEBUG, `[Handshake] Unknown FML handshake packet ${packetID}; no response sent`);
+                            this.log(LogLevel.DEBUG, `[Handshake] Unknown FML handshake packet ${packetID}; no response sent (msgId=${packet.messageId})`);
                             return;
                         }
 
@@ -2071,7 +2096,25 @@ export class MCClient extends EventEmitter {
                             this.log(LogLevel.DEBUG, `[Handshake] Replying to known Forge login channel ${fmlChannel} packetID=${packetID}`);
                             sendLoginPluginResponse(packet.messageId, this.wrapFmlLoginPayload(fmlChannel, replyPayload));
                         } else {
-                            this.log(LogLevel.DEBUG, `[Handshake] Unknown FML wrapper channel ${fmlChannel}; no response sent`);
+                            // 各 mod 的登录通道（如 silentgear:network / zeta:main）：内容无法伪造。
+                            // 依赖关系（Forge 1.20.1 源码）：
+                            //   - LoginWrapper.wrapperReceived 从**客户端应答里**读取目标通道，把包派发给该通道；
+                            //   - 待确认索引记录在 HandshakeHandler.sentMessages 里，与通道无关；
+                            //   - 所以可以在 fml:handshake 通道回一个 C2SAcknowledge(99)，索引照样被清掉，
+                            //     握手得以继续（mod 自己的登录处理器不会运行，但我们只需要玩家列表/TPS）。
+                            // 若在 mod 通道本身回伪造消息，consume() 会因 discriminator 未注册而判为未处理，
+                            // 服务端随即 multiplayer.disconnect.unexpected_query_response 断开。
+                            this.unknownForgeLoginChannels.set(fmlChannel, (this.unknownForgeLoginChannels.get(fmlChannel) ?? 0) + 1);
+                            const replyMode = String(this.clientOptions?.forgeLoginChannelReply ?? 'handshake-ack');
+                            if (replyMode === 'handshake-ack') {
+                                this.log(LogLevel.DEBUG, `[Handshake] Unknown FML wrapper channel ${fmlChannel} packetID=${packetID}; acked on fml:handshake`);
+                                sendLoginPluginResponse(packet.messageId, this.wrapFmlLoginPayload('fml:handshake', this.writeVarInt(99)));
+                            } else if (replyMode === 'empty') {
+                                this.log(LogLevel.DEBUG, `[Handshake] Unknown FML wrapper channel ${fmlChannel} packetID=${packetID}; replied "not understood"`);
+                                sendLoginPluginResponse(packet.messageId);
+                            } else {
+                                this.log(LogLevel.DEBUG, `[Handshake] Unknown FML wrapper channel ${fmlChannel} packetID=${packetID}; no response sent`);
+                            }
                         }
                     }
                 } catch (e) {
@@ -2386,9 +2429,22 @@ export class MCClient extends EventEmitter {
                 void this.setupChatProfileKeys(this.client);
             }
             this.status.chatSigning = !!(this.client as any)?.profileKeys;
+            // login success 说明加密握手已完成，此时应用暂存的签名密钥是安全的
+            if (!(this.client as any)?.profileKeys && this.pendingProfileKeys && this.client) {
+                (this.client as any).profileKeys = this.pendingProfileKeys;
+                this.pendingProfileKeys = null;
+                this.status.chatSigning = true;
+                this.log(LogLevel.DEBUG, '[ChatSigning] 已应用聊天签名密钥（login success）');
+            }
 
             this.emit('connected');
         });
+
+        // 监听器全部注册完毕后再申请聊天签名密钥（最多阻塞 chatSigningTimeoutMs，超时转后台），
+        // 这样即使证书接口慢也不会拖累 FML 登录握手。
+        if (this.client && this.status.enforcesSecureChat) {
+            await this.setupChatProfileKeys(this.client);
+        }
     }
 
     // minecraft-protocol 1.68.0 的 client/chat.js 会对 `declare_commands` 做 validateCommandTree 校验，
@@ -2463,6 +2519,18 @@ export class MCClient extends EventEmitter {
     private markPlayReady() {
         if (this.playReady) return;
         this.playReady = true;
+
+        if (this.unknownForgeLoginChannels.size > 0) {
+            const total = Array.from(this.unknownForgeLoginChannels.values()).reduce((a, b) => a + b, 0);
+            const detail = Array.from(this.unknownForgeLoginChannels)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 8)
+                .map(([channel, count]) => `${channel}×${count}`)
+                .join(', ');
+            this.log(LogLevel.INFO, `[Handshake] 已进入 play 状态；登录阶段共回应 ${total} 个 mod 登录通道请求`
+                + `（${this.unknownForgeLoginChannels.size} 个通道，均回"不理解"）: ${detail}`);
+        }
+
         this.log(LogLevel.INFO, '[Connection] Play state is ready for commands');
         this.startTpsFallbackTimer();
     }
@@ -2470,6 +2538,7 @@ export class MCClient extends EventEmitter {
     private cleanup() {
         this.players.clear();
         this.playReady = false;
+        this.unknownForgeLoginChannels.clear();
         this.stopTpsFallbackTimer();
         this.stopConnectionDiagnostics();
         this.tpsCommandPendingUntil = 0;
@@ -2822,13 +2891,41 @@ export class MCClient extends EventEmitter {
                 throw new Error('响应缺少 keyPair');
             }
 
-            client.profileKeys = {
-                private: createPrivateKey({ key: data.keyPair.privateKey, format: 'pem' }),
-                public: createPublicKey({ key: data.keyPair.publicKey, format: 'pem' }),
+            // Mojang 的响应有时是 PEM，有时是裸 base64(DER)。两种都要兼容，
+            // 否则会报 asn1 "wrong tag" 并导致签名不可用。
+            const importPrivate = (value: string) => {
+                try {
+                    return createPrivateKey({ key: value, format: 'pem' });
+                } catch {
+                    const der = Buffer.from(String(value).replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+                    return createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+                }
+            };
+            const importPublic = (value: string) => {
+                try {
+                    return createPublicKey({ key: value, format: 'pem' });
+                } catch {
+                    const der = Buffer.from(String(value).replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+                    return createPublicKey({ key: der, format: 'der', type: 'spki' });
+                }
+            };
+
+            // 注意：不能在这里就把 profileKeys 赋给 client —— minecraft-protocol 的加密握手用
+            // `client.profileKeys == null` 判断是否发送 verify token（client/encrypt.js），
+            // 提前设置会让正版服务器回 encryptionLoginError。密钥先暂存，登录成功后再应用。
+            const profileKeys = {
+                private: importPrivate(data.keyPair.privateKey),
+                public: importPublic(data.keyPair.publicKey),
                 signature: Buffer.from(data.publicKeySignature ?? data.publicKeySignatureV2, 'base64'),
                 signatureV2: Buffer.from(data.publicKeySignatureV2 ?? data.publicKeySignature, 'base64'),
                 expiresOn: new Date(data.expiresAt)
             };
+
+            this.pendingProfileKeys = profileKeys;
+            if (String(client.state) === 'play') {
+                client.profileKeys = profileKeys;
+                this.pendingProfileKeys = null;
+            }
 
             this.log(LogLevel.INFO, `[ChatSigning] 已取得聊天签名密钥（有效期至 ${data.expiresAt}），命令将使用 chat_command_signed`);
             this.status.chatSigning = true;
@@ -2846,6 +2943,14 @@ export class MCClient extends EventEmitter {
         try {
             // chat_session_update 只在 play 阶段有效：configuration 阶段的补发会被服务端忽略/报错
             if (String(client.state) !== 'play') return;
+
+            // 加密握手已完成（已进入 play），此时才可以把签名密钥交给库
+            if (!client.profileKeys && this.pendingProfileKeys) {
+                client.profileKeys = this.pendingProfileKeys;
+                this.pendingProfileKeys = null;
+                this.status.chatSigning = true;
+                this.log(LogLevel.DEBUG, '[ChatSigning] 已应用聊天签名密钥（play 阶段）');
+            }
 
             const mcData = require('minecraft-data')(client.version);
             if (!mcData.supportFeature('useChatSessions')) return;
