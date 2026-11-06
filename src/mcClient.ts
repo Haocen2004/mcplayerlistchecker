@@ -19,10 +19,15 @@ const DEFAULT_TPS_FALLBACK_IDLE_MS = 30_000;
 const DEFAULT_TPS_FALLBACK_CHECK_INTERVAL_MS = 10_000;
 const DEFAULT_TPS_FALLBACK_RESPONSE_WINDOW_MS = 5_000;
 const DEFAULT_TPS_FALLBACK_MIN_COOLDOWN_MS = 60_000;
-// minecraft-protocol 的 keepalive 插件默认 30 秒收不到 keep_alive 就主动 end('keepAliveError')。
-// 该计时器只由 keep_alive 包刷新（不像原版客户端看任意数据包），网络抖动/丢包重传时容易误断，
-// 所以默认放宽到 60 秒，并允许通过 checkTimeoutInterval 配置。
-const DEFAULT_KEEPALIVE_TIMEOUT_MS = 60_000;
+// 原版客户端的读超时语义：只有连续这么久**完全收不到任何数据包**才断开（Netty ReadTimeoutHandler）。
+// 30 秒是原版 Connection 的默认读超时，也是服务端 keep_alive（15 秒一次、容忍 30 秒无响应）的阈值，
+// 因此 bot 的容忍度与原版玩家一致：只要还在收包就不会被判定超时。
+const DEFAULT_NETWORK_READ_TIMEOUT_MS = 30_000;
+// 把库 keepalive 插件自带的计时器禁用掉（它只由 keep_alive 包刷新，会让 bot 比真实客户端先掉线）。
+// 这里给一个实际不可能等到的值，插件本身保留以便自动回 keep_alive。
+const LIBRARY_KEEPALIVE_TIMER_DISABLED_MS = 24 * 60 * 60 * 1000;
+// 静默看门狗检查间隔（1 秒足够精确，开销可忽略）
+const NETWORK_WATCHDOG_INTERVAL_MS = 1_000;
 // 每个收到的包都打 DEBUG 日志在大型模组服上本身就会拖慢事件循环，这里按秒限流。
 const DEFAULT_PACKET_LOG_PER_SECOND = 50;
 const DEFAULT_STATS_INTERVAL_MS = 30_000;
@@ -32,8 +37,7 @@ const PACKET_DATA_LOG_MAX_BYTES = 4_096;
 // 连续失败达到上限才彻底停用。
 const DEFAULT_TPS_COMMAND_FAILURE_BACKOFF_MS = 600_000;
 const DEFAULT_TPS_COMMAND_MAX_FAILURES = 5;
-const MINECRAFT_CERTIFICATES_URL = 'https://api.minecraftservices.com/player/certificates';
-// 申请聊天签名密钥时最多阻塞这么久（为了保证进入世界前密钥就绪、会话能及时声明）；
+const MINECRAFT_CERTIFICATES_URL = 'https://api.minecraftservices.com/player/certificates';// 申请聊天签名密钥时最多阻塞这么久（为了保证进入世界前密钥就绪、会话能及时声明）；
 // 超时后不再阻塞连接流程，改为后台继续申请。
 const DEFAULT_CHAT_SIGNING_TIMEOUT_MS = 30_000;
 // play 状态下高频且无信息量的包，不打逐包日志
@@ -198,6 +202,9 @@ export class MCClient extends EventEmitter {
     private eventLoopLagPeakMs = 0;
     private eventLoopTimer: NodeJS.Timeout | null = null;
     private statsTimer: NodeJS.Timeout | null = null;
+    // 原版语义的"静默看门狗"：只有连续 networkTimeoutMs 收不到任何数据包才断开
+    private networkWatchdogTimer: NodeJS.Timeout | null = null;
+    private networkTimeoutTriggered = false;
     private serverModVersions: Map<string, string> = new Map();
     private neoForgeProbeChannels: Map<string, NeoForgeProbeState> = new Map();
     private neoForgeAcceptedChannels: Map<string, NeoForgeChannelDeclaration> = new Map();
@@ -1730,9 +1737,13 @@ export class MCClient extends EventEmitter {
             // Minecraft 26.1 的 login_start 需要 playerUUID，而 minecraft-protocol 只在 offline/microsoft
             // 认证分支下准备 client.uuid；Mojang 账号认证早已下线，因此非正版登录一律走 offline 分支。
             auth: this.authType === 'microsoft' ? 'microsoft' : 'offline',
-            // 库的 keepalive 插件只用 keep_alive 包刷新这个超时（原版客户端看任意数据包），
-            // 默认 30 秒在网络抖动时容易误判，这里放宽到 60 秒并允许配置。
-            checkTimeoutInterval: this.getKeepAliveTimeoutMs(),
+            // 原版客户端用 Netty ReadTimeoutHandler 语义：只要还在**收到任意数据包**就不算超时，
+            // 只有连续 ReadTimeout 时间完全静默才断开（默认 30 秒）。
+            // minecraft-protocol 的 keepalive 插件相反：它只在收到 keep_alive 包时重置一个定时器，
+            // 网络抖动漏掉/延迟一个心跳就直接 client.end('keepAliveError')，导致 bot 比真实客户端先掉线。
+            // 因此把库的计时器设成一个实际不会触发的值（保留插件本身以自动回 keep_alive），
+            // 改由下面的「静默看门狗」按原版语义判断超时。
+            checkTimeoutInterval: LIBRARY_KEEPALIVE_TIMER_DISABLED_MS,
             profilesFolder: './.minecraft_auth', // Enable built-in auth caching
             hideErrors: true, // Suppress packet parsing errors (e.g. declare_commands on modded servers)
             ...this.clientOptions
@@ -2378,10 +2389,10 @@ export class MCClient extends EventEmitter {
                 : '本连接未收到任何数据包';
             this.log(LogLevel.INFO, `Disconnected: ${reason}（${detail}）`);
 
-            if (/keepAlive|timed out/i.test(String(reason))) {
-                this.log(LogLevel.WARN, `[Connection] 判定为心跳超时：${this.getKeepAliveTimeoutMs()}ms 内未收到 keep_alive 包。`
-                    + '该计时器仅由 keep_alive 包刷新（原版客户端看任意数据包，容忍度更高），'
-                    + '网络抖动明显时可调大 config.json 的 checkTimeoutInterval。');
+            if (/keepAlive|timed out|readTimeout/i.test(String(reason))) {
+                this.log(LogLevel.WARN, `[Connection] 判定为读超时：连续 ${this.getNetworkReadTimeoutMs()}ms 未收到任何数据包`
+                    + `（原版客户端语义；实际静默 ${lastPacketAgo < 0 ? 'n/a' : `${lastPacketAgo}ms`}）。`
+                    + '可用 config.json 的 networkTimeoutMs 调整（越小越像"抖动即重连"，越大容忍度越高）。');
             }
 
             if (this.isChatValidationFailure(reason)) {
@@ -2552,9 +2563,9 @@ export class MCClient extends EventEmitter {
         }
     }
 
-    private getKeepAliveTimeoutMs(): number {
-        const configured = Number(this.clientOptions?.checkTimeoutInterval);
-        return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_KEEPALIVE_TIMEOUT_MS;
+    private getNetworkReadTimeoutMs(): number {
+        const configured = Number(this.clientOptions?.networkTimeoutMs ?? this.clientOptions?.checkTimeoutInterval);
+        return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_NETWORK_READ_TIMEOUT_MS;
     }
 
     // 连接健康度统计：便于区分"真·网络断开"与"客户端自身阻塞导致的心跳超时"。
@@ -2583,11 +2594,35 @@ export class MCClient extends EventEmitter {
             const lastPacketAgo = this.lastPacketReceivedAt ? Date.now() - this.lastPacketReceivedAt : -1;
             this.log(LogLevel.DEBUG, `[Connection] 收包 ${this.receivedPacketCount} / 发包 ${this.sentPacketCount}`
                 + `，事件循环延迟峰值 ${this.eventLoopLagPeakMs}ms`
-                + `，距上次收包 ${lastPacketAgo < 0 ? 'n/a' : `${lastPacketAgo}ms`}`);
+                + `，距上次收包 ${lastPacketAgo < 0 ? 'n/a' : `${lastPacketAgo}ms`}`
+                + `，静默超时阈值 ${this.getNetworkReadTimeoutMs()}ms`);
             this.eventLoopLagPeakMs = 0;
         }, DEFAULT_STATS_INTERVAL_MS);
         statsTimer.unref?.();
         this.statsTimer = statsTimer;
+
+        // 与原版客户端一致的读超时：只统计"完全静默"的时长。
+        // 原版 Netty ReadTimeoutHandler 也只在没有任何入站数据时触发，
+        // 因此网络抖动导致 keep_alive 延迟/丢包时，只要其它包还在流动，bot 就不会掉线。
+        this.networkTimeoutTriggered = false;
+        const watchdog = setInterval(() => {
+            if (this.networkTimeoutTriggered) return;
+            if (!this.lastPacketReceivedAt) return; // 尚未收到首个包（连接建立中）
+            const timeoutMs = this.getNetworkReadTimeoutMs();
+            const silenceMs = Date.now() - this.lastPacketReceivedAt;
+            if (silenceMs < timeoutMs) return;
+
+            this.networkTimeoutTriggered = true;
+            this.log(LogLevel.WARN, `[Connection] 连续 ${silenceMs}ms 未收到任何数据包（阈值 ${timeoutMs}ms，与原版客户端读超时一致），`
+                + '主动断开并等待重连；若要更宽容可调大 config.json 的 networkTimeoutMs');
+            try {
+                this.client?.end('readTimeout');
+            } catch (e) {
+                this.log(LogLevel.DEBUG, `[Connection] end('readTimeout') 调用失败：${(e as Error).message}`);
+            }
+        }, NETWORK_WATCHDOG_INTERVAL_MS);
+        watchdog.unref?.();
+        this.networkWatchdogTimer = watchdog;
     }
 
     private stopConnectionDiagnostics() {
@@ -2598,6 +2633,10 @@ export class MCClient extends EventEmitter {
         if (this.statsTimer) {
             clearInterval(this.statsTimer);
             this.statsTimer = null;
+        }
+        if (this.networkWatchdogTimer) {
+            clearInterval(this.networkWatchdogTimer);
+            this.networkWatchdogTimer = null;
         }
     }
 

@@ -131,6 +131,9 @@ async function bootstrap() {
     if (config.tpsFallbackCommand !== undefined) mcClient.clientOptions.tpsFallbackCommand = config.tpsFallbackCommand;
     if (config.chatSigning !== undefined) mcClient.clientOptions.chatSigning = config.chatSigning;
     if (config.chatSigningTimeoutMs !== undefined) mcClient.clientOptions.chatSigningTimeoutMs = config.chatSigningTimeoutMs;
+    // 与原版客户端一致的读超时：连续这么久收不到任何数据包才断开（默认 30 秒）
+    if (config.networkTimeoutMs !== undefined) mcClient.clientOptions.networkTimeoutMs = config.networkTimeoutMs;
+    if (config.checkTimeoutInterval !== undefined) mcClient.clientOptions.checkTimeoutInterval = config.checkTimeoutInterval;
     if (config.tpsCommandFailureBackoffMs !== undefined) mcClient.clientOptions.tpsCommandFailureBackoffMs = config.tpsCommandFailureBackoffMs;
     if (config.tpsCommandMaxFailures !== undefined) mcClient.clientOptions.tpsCommandMaxFailures = config.tpsCommandMaxFailures;
 

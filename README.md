@@ -73,6 +73,7 @@
     "serverModeHost": "0.0.0.0", // 可选：server 模式监听地址
     "serverModePort": 25566, // 可选：server 模式监听端口
     "apiPort": 3000,          // API 服务器端口
+    "networkTimeoutMs": 30000, // 可选：读超时（默认 30000，与原版客户端一致）；连续这么久收不到任何包才断开重连
     "mongoUri": "mongodb://localhost:27017", // MongoDB 连接地址
     "mongoDb": "mc_checker"   // 数据库名称
 }
@@ -215,6 +216,11 @@ A: 服务端拒绝了我们的聊天/命令包。原版客户端的做法是：�
 `GET /status` 与 `/players` 会返回两个诊断字段：`enforcesSecureChat`（服务端是否强制安全聊天）与 `chatSigning`（本连接是否已具备签名密钥）。
 
 相关配置：`chatSigning`（默认 true）、`chatSigningTimeoutMs`（默认 30000，申请签名密钥时最多阻塞这么久，超时后转为后台继续申请）、`tpsCommandFailureBackoffMs`、`tpsCommandMaxFailures`。**服务端要求安全聊天而本端尚无签名密钥时，程序会跳过主动 TPS 探测**（发送未签名命令会直接被断开），此时 TPS 只读 footer，密钥就绪后自动恢复探测。
+
+**Q: 网络一抖动 bot 就掉线重连，但同服务器里的真实玩家没事？**
+A: 这是 `minecraft-protocol` 的 keepalive 实现与原版客户端的语义差异造成的：库的计时器**只在收到 `keep_alive` 包时重置**（`src/client/keepalive.js`），网络抖动导致某个心跳延迟/丢包就会触发 `client.end('keepAliveError')`；而原版客户端的读超时（Netty `ReadTimeoutHandler`）语义是**只要还在收到任意数据包就不算超时**，只有连续静默才会断开。
+本程序已改为与原版一致：禁用库自带的 keepalive 计时器（保留自动回包），改用 1 秒粒度的「静默看门狗」——连续 `networkTimeoutMs`（默认 **30000ms**，即原版读超时/服务端 keep_alive 容忍阈值）收不到任何数据包才断开并重连。因此 bot 的掉线条件与真实玩家相同，不会比别人更早掉线。
+需要更宽容可调大 `networkTimeoutMs`，想"抖动即重连"可调小；旧配置项 `checkTimeoutInterval` 仍兼容（作为同一阈值的别名）。
 
 **Q: 26.1.2 服务器的 ping 结果里 `playersOnline` 一直是 0？**
 A: `playersOnline` 来自服务器状态响应（`status`），而玩家明细来自游戏内 `player_info`。如果服务器在空闲时会暂停（`Server empty for 60 seconds, pausing`），状态响应可能暂时只反映机器人自己或为空，以 `/players` 返回的 `players` 数组为准。
